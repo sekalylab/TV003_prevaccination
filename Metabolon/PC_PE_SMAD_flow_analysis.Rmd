@@ -1,0 +1,73 @@
+---
+title: "PC_PE_flow"
+author: "Adam Pelletier"
+date: "7/27/2021"
+output: html_document
+---
+
+
+```{r setup, message = FALSE, warning=FALSE}
+#### Load required packages for analysis
+## Some packages may require installation from Bioconductor : "https://bioconductor.org/install/" 
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(broom))
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(getwd())
+```
+
+## RNA-Seq Downstream analysis
+
+### Setup directories 
+
+``` {r dirSetup}
+setup_dir <- function(dir_string) { 
+  ### Verifies creates a directory if it doesn't exist. Returns the dir_path
+  if (dir.exists(dir_string)){
+    dir_set <- dir_string
+  } else {
+    dir.create(dir_string) 
+    dir_set <- dir_string
+  }
+  return(dir_set)
+}
+
+inputDir <- setup_dir("input")
+
+
+outputDir <- setup_dir("output")
+figureDir <- setup_dir(file.path(outputDir,"figures"))
+dataOutDir <- setup_dir(file.path(outputDir,"data"))
+
+
+
+```
+
+```{r laod data}
+pSMAD <- readxl::read_xlsx("Receptors_formatted_ANP.xlsx", sheet = "pSMAD_edited", na = "NA") %>%
+          mutate(Timepoint = paste(Timepoint, "hr", sep ="")) %>%
+          mutate(condition = paste(Donor, Timepoint, Stimulation, sep = "_")) %>%
+          dplyr::select(-Sample) %>%
+          gather(phenotype, value, -condition, -Timepoint, -Donor, -Stimulation)
+receptor_df <- readxl::read_xlsx("Receptors_formatted_ANP.xlsx", sheet = "Receptors_edited") %>%
+          mutate(Timepoint = paste(Timepoint, "hr", sep ="")) %>%
+          mutate(condition = paste(Donor, Timepoint, Stimulation, sep = "_")) %>%
+          dplyr::select(-Sample) %>%
+          gather(phenotype, value, -condition, -Timepoint, -Donor, -Stimulation) 
+
+
+keep_df <- receptor_df <- readxl::read_xlsx("Receptors_formatted_ANP.xlsx", sheet = "legend") %>%
+            dplyr::select(Name, keep)
+
+```
+
+
+```{r merge_df}
+
+merged_df <- bind_rows(pSMAD, receptor_df) %>%
+              left_join(., keep_df, by = c("phenotype" ="Name"))
+
+
+
+```
+

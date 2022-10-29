@@ -1,0 +1,1301 @@
+---
+title: "outcome_calc"
+author: "Adam Pelletier"
+date: "6/5/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages(library(rstudioapi))
+suppressPackageStartupMessages(library(plyr))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(purrr))
+suppressPackageStartupMessages(library(tidyr))
+suppressPackageStartupMessages(library(pheatmap))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(biomaRt))
+suppressPackageStartupMessages(library(readr))
+suppressPackageStartupMessages(library(RCurl))
+suppressPackageStartupMessages(library(knitr))
+suppressPackageStartupMessages(library(tibble))
+suppressPackageStartupMessages(library(stringr))
+suppressPackageStartupMessages(library(WriteXLS))
+suppressPackageStartupMessages(library(ggpubr))
+suppressPackageStartupMessages(library(pracma))
+suppressPackageStartupMessages(library(kableExtra))
+suppressPackageStartupMessages(library(scales))
+suppressPackageStartupMessages(library(drc))
+suppressPackageStartupMessages(library(pspline))
+suppressPackageStartupMessages(library(sicegar))
+suppressPackageStartupMessages(library(PCAtools))
+suppressPackageStartupMessages(library(GSEABase))
+suppressPackageStartupMessages(library(broom))
+suppressPackageStartupMessages(library(GGally))
+suppressPackageStartupMessages(library(Hmisc))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+library(VennDiagram)
+knitr::opts_knit$set(root.dir = getwd())
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Dengue Vaccine Outcome Calculation
+
+This analysis is to compute the selected outcomes for the dengue project. 
+Analysis of Antibody titers shows a clear inconsistency accross timepoints:
+some patients have their peak early on , while others respond later. Then, others respond only after the boost, and others are only affected by the primary response. This means that using raw titers is not optimal for an outcome variable against each serotype. 
+
+Moreover, a peak response can be high at one timepoint and fade away rapidly after, which is another inherent problem of titers. 
+
+We opted to measure the Area Under the Curve (AUC) of Titers before and After the Boost, separately, which integrates the time factor in the strength of the response. This allows to use a single metric per serotype as an outcome variable, no matter when each patient peaked in their response. This is computed simply by using a trapezoid function to integrate the AUC. 
+
+Second, the breadth of the response is a critical parameter in response to a dengue vaccine: the capacity to induce a response against only a few serotypes is associated with an enhanced susceptibility against the other serotypes through antibody-dependent enhancement (ADE). Thus, we wish to determine the signature associated with a high breadth response, where the breadth is defined as the number of serotypes with a positive Ab titer (>10) at a given timepoint for each patient. This can be computed at any timepoint.
+D271, the latest timepoint at which titers were measured, should theoritically be the optimal timepoint, given that the goal of a vaccine is to induce a long terme polyvalent response.  However, many patients did not follow through to the last visit, and thus D271 breadth cannot be computed for all patients. We have a greater sample size at D91 , which is the second timepoint that will be used for analysis of breadth.
+
+
+
+```{r }
+ab_titers <- read_excel(path="DV_MasterSheet_v4_ANP_PBMC.xlsx", sheet = "Ab_titers")
+#ab_titers_post <- read_excel(path="Neutralization titers PRNT fijnal SEPT 14.xls", sheet = "Ab_titers")
+visit_schedule <- read_excel(path="visit_schedule.xlsx")
+ab_titers <- merge(ab_titers,visit_schedule, by="Visit_code")
+outcome_df <- ab_titers %>% gather(serotype, titer, DV1,DV2,DV3,DV4) %>% as.tibble(.) %>%
+  mutate(titer = gsub(">", "", titer)) %>%
+  mutate(titer = gsub("<", "", titer)) %>%
+  mutate(titer = as.numeric(titer)) %>%
+  filter(!is.na(titer)) %>%
+  group_by(PID) %>%
+  mutate(timespan_check = ifelse(sum(Day == 91) == 4, "ok", "missing")) %>%
+  ungroup()
+```
+
+```{r calculate AUC for extra_patients}
+
+naives <- read_excel("Neutralization titers PRNT fijnal SEPT 14_reformatted_ANP.xls", sheet = "1000 series reorg") %>%
+            gather(Sero_timepoint, titer, -ID, -Status) 
+
+all_PID_extra <- read_excel("Neutralization titers PRNT fijnal SEPT 14_reformatted_ANP.xls", sheet = "2000 series reorg")  %>%
+            dplyr::rename(Status = "One shot vaccine") %>%
+            gather(Sero_timepoint, titer, -ID, -Status) %>%
+            bind_rows(naives) %>%
+            separate(Sero_timepoint, into = c("Timepoint", "serotype"), sep = "_") %>%
+            mutate(titer = as.numeric(gsub(">|<",  "", titer))) %>%
+            mutate(serotype = gsub("D", "DV", serotype)) %>%
+            group_by(ID) %>%
+            mutate(Immune_status_at_baseline = ifelse(max(titer[Timepoint == "V1"]) > 10, "Immune", "Naive")) %>%
+            mutate(timespan_check = ifelse(sum(Timepoint == "I3") == 4, "ok", "missing")) %>%
+            ungroup() %>%
+            mutate(Timepoint = gsub("V1", 0, Timepoint)) %>%
+            mutate(Timepoint = gsub("I1", 28, Timepoint)) %>%
+            mutate(Timepoint = gsub("I2", 56, Timepoint)) %>%
+            mutate(Timepoint = gsub("I3", 91, Timepoint)) %>%
+            mutate(Timepoint = as.numeric(Timepoint)) %>%
+            group_by(ID, serotype) %>%
+            mutate(AUC = trapz(Timepoint,titer)) %>%
+            mutate(AUC = ifelse(timespan_check == "missing", NA, AUC)) %>%
+            mutate(AUC_type = "AUCp") %>%
+            mutate(max_titer = max(titer, na.rm = T)) %>%
+            mutate(breadth_count = ifelse(max_titer > 10 & Timepoint == 0, 1, 0)) %>%
+            ungroup(.) %>%
+            group_by(ID) %>%
+            mutate(breadth_num = sum(breadth_count)) %>%
+            mutate(Breadth_dichot = ifelse(breadth_num == 4, "High", "Low")) %>%
+            ungroup() %>%
+            mutate(outcome = paste(serotype, AUC_type, sep = "_")) %>%
+            mutate(Group = ifelse(ID < 2000, "A", "B")) %>%
+            mutate(ID = paste("DEN", ID,Group, sep ="" )) %>%
+            dplyr::select(-titer, -serotype, -timespan_check, -Timepoint, -AUC_type, -Group, -breadth_num, 
+                          -max_titer, -breadth_count ) %>%
+            unique(.) %>%
+            mutate(AUC = log(AUC)) %>%
+            spread(outcome, AUC) %>%
+            dplyr::arrange(ID) 
+            
+            
+            
+
+writexl::write_xlsx(all_PID_extra, path = file.path("AUCp_extended_PID.xlsx"))
+
+
+
+
+```
+Area Under the curve calculations: p for prime, b for boost, and t for total (combined AUC). 
+Some patients have missing titer data post boost, leading to NA in the AUC calculation. 
+Also, Group B patients have AUCb columns calculated, despite having no data accross the cohort, just for the sake of having a single dataframe containing all outcome in a one row per patient format. 
+```{r }
+AUCp <- outcome_df %>% 
+  filter(Day < 180) %>%
+  arrange(serotype, Day) %>%
+  group_by(PID, serotype) %>%
+  mutate(AUC = trapz(Day,titer)) %>%
+  mutate(AUC = ifelse(timespan_check == "missing", NA, AUC)) %>%
+  mutate(AUC_type = "AUCp")
+
+AUCb <- outcome_df %>% 
+  filter(Day >= 180) %>%
+  arrange(serotype, Day) %>%
+  group_by(PID, serotype) %>%
+  mutate(AUC = trapz(Day,titer)) %>%
+  mutate(AUC_type = "AUCb")
+
+AUC <- rbind(AUCp,AUCb) %>% ungroup(.) %>%
+  mutate(outcome_AUC = paste(serotype,AUC_type, sep="_")) %>%
+  dplyr::select(-...1,-titer, -Visit_code, -Day, -Legend, -serotype, -AUC_type, -Initial_status, -Revised_group, -Initial_group, -timespan_check) %>%
+  arrange(PID, outcome_AUC) %>%
+  mutate(AUC_log = log(AUC)) %>%
+  mutate(outcome_AUC_log = paste(outcome_AUC,"log", sep="_")) %>%
+  unique(.) %>% 
+  dplyr::select(-AUC, -outcome_AUC) %>%
+  mutate(AUC_log = ifelse(AUC_log == "-Inf",NA, AUC_log)) %>%
+  #spread(outcome_AUC,AUC) %>%
+  spread(outcome_AUC_log,AUC_log) #%>%
+  #gather(outcome,value,-PID) %>%
+  # filter(!is.na(value)) %>%
+   #%>%
+  #spread(outcome,value)
+
+AUC_nontr <- rbind(AUCp,AUCb) %>% ungroup(.) %>%
+  mutate(outcome_AUC = paste(serotype,AUC_type, sep="_")) %>%
+  dplyr::select(-...1,-titer, -Visit_code, -Day, -Legend, -serotype, -AUC_type, -Initial_status, -Revised_group, -Initial_group, -timespan_check) %>%
+  arrange(PID, outcome_AUC) %>%
+  unique(.) %>% 
+  #dplyr::select(-AUC, -outcome_AUC) %>%
+  mutate(AUC = ifelse(AUC == "-Inf",NA, AUC)) %>%
+  spread(outcome_AUC,AUC) 
+
+print(AUCp)
+
+# row.names(AUC) <- NULL
+# kable(AUC) %>%
+#   kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+```
+
+
+Breadth of the response calculation
+```{r }
+breadth_df <- outcome_df %>%
+  mutate(pos_check = ifelse(titer >10,1,0)) %>%
+  group_by(PID,Day) %>%
+  summarize(breadth = sum(pos_check)) %>%
+  mutate(outcome = paste("D",Day, sep="")) %>%
+  mutate(outcome = paste(outcome, "Breadth", sep="_")) %>%
+  mutate(outcome_lowhi = paste(outcome,"lowhi",sep="_")) %>%
+  mutate(lowhi_value = ifelse(breadth >=3, "high","low")) %>%
+  dplyr::select(-Day) %>%
+  spread(outcome_lowhi, lowhi_value) %>%
+  spread(outcome, breadth) %>%
+  gather(outcome, value, -PID) %>%
+  filter(!is.na(value)) %>%
+  spread(outcome,value)
+
+# row.names(breadth_df) <- NULL
+# kable(breadth_df) %>%
+#   kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+```
+Titer curves for presentation 
+``` {r }
+#print(outcome_df)
+
+titer_graph <- function(df,x,y) {
+  print(df)
+}
+
+DV1 <- outcome_df %>%  
+    filter(Initial_group == "A") %>%
+    filter(serotype == "DV1") %>%
+    filter(!grepl("Placebo",Initial_status)) %>%
+    filter(PID %in% outcome_df_final[outcome_df_final$Immune_status_at_baseline == "Naive",]$PID) %>%
+    #filter(PID == "DEN1021A") %>%
+    #filter(PID %in% c("DEN1001A", "DEN1011A", "DEN1012A", "DEN1013A", "DEN1014A", "DEN1045A", "DEN1049A")) %>%
+    #group_by(serotype) %>%
+    ggplot(aes(x = Day, y= titer)) +
+      geom_point(aes(colour=factor(PID), size=0.1, stroke = 0)) +
+      geom_line(aes(group=PID), size = 0.5) +
+      scale_x_continuous("Day", breaks=c(0,28,56,91,181,208,236,271)) +
+      scale_y_log10("nAB titers", limits=c(10,1e4), breaks = trans_breaks("log10", function(x) 10^x),
+                    labels = trans_format('log10',math_format(10^.x))) + 
+      theme_bw() +
+      labs(title = "DV1") + 
+      theme(legend.position="none", axis.text=element_text(size=14),
+            axis.title=element_text(size=16))
+ggsave(DV1, filename= "figures/DV1_titer_curve.pdf", device = "pdf")
+
+DV2 <- outcome_df %>%  
+    filter(Initial_group == "A") %>%
+    filter(serotype == "DV2") %>%
+    filter(!grepl("Placebo",Initial_status)) %>%
+  filter(PID %in% outcome_df_final[outcome_df_final$Immune_status_at_baseline == "Naive",]$PID) %>%
+    ggplot(aes(x = Day, y= titer)) +
+      geom_point(aes(colour=factor(PID), size=0.1, stroke = 0)) +
+      geom_line(aes(group=PID), size = 0.5) +
+      scale_x_continuous("Day", breaks=c(0,28,56,91,181,208,236,271)) +
+      scale_y_log10("nAB titers", limits=c(10,1e4), breaks = trans_breaks("log10", function(x) 10^x),
+                    labels = trans_format('log10',math_format(10^.x))) + 
+      theme_bw() +
+      labs(title = "DV2") + 
+      theme(legend.position="none", axis.text=element_text(size=14),
+            axis.title=element_text(size=16))
+ggsave(DV2, filename= "figures/DV2_titer_curve.pdf", device = "pdf", width = 7, height = 7)
+
+DV3 <- outcome_df %>%  
+    filter(Initial_group == "A") %>%
+    filter(serotype == "DV3") %>%
+    filter(!grepl("Placebo",Initial_status)) %>%
+  filter(PID %in% outcome_df_final[outcome_df_final$Immune_status_at_baseline == "Naive",]$PID) %>%
+    ggplot(aes(x = Day, y= titer)) +
+      geom_point(aes(colour=factor(PID), size=0.1, stroke = 0)) +
+      geom_line(aes(group=PID), size = 0.5) +
+      scale_x_continuous("Day", breaks=c(0,28,56,91,181,208,236,271)) +
+      scale_y_log10("nAB titers", limits=c(10,1e4), breaks = trans_breaks("log10", function(x) 10^x),
+                    labels = trans_format('log10',math_format(10^.x))) + 
+      theme_bw() +
+      labs(title = "DV3") + 
+      theme(legend.position="none", axis.text=element_text(size=14),
+            axis.title=element_text(size=16))
+ggsave(DV3, filename= "figures/DV3_titer_curve.pdf", device = "pdf")
+
+DV4 <- outcome_df %>%  
+    filter(Initial_group == "A") %>%
+    filter(serotype == "DV4") %>%
+    filter(!grepl("Placebo",Initial_status)) %>%
+  filter(PID %in% outcome_df_final[outcome_df_final$Immune_status_at_baseline == "Naive",]$PID) %>%
+    ggplot(aes(x = Day, y= titer)) +
+      geom_point(aes(colour=factor(PID), size=0.1, stroke = 0)) +
+      geom_line(aes(group=PID), size = 0.5) +
+      scale_x_continuous("Day", breaks=c(0,28,56,91,181,208,236,271)) +
+      scale_y_log10("nAB titers", limits=c(10,1e4), breaks = trans_breaks("log10", function(x) 10^x),
+                    labels = trans_format('log10',math_format(10^.x))) + 
+      theme_bw() +
+      labs(title = "DV4") + 
+      theme(legend.position="none", axis.text=element_text(size=14),
+            axis.title=element_text(size=16))
+ggsave(DV4, filename= "figures/DV4_titer_curve.pdf", device = "pdf")
+
+DV1_sub <- outcome_df %>%  
+    filter(Initial_group == "A") %>%
+    filter(serotype == "DV1") %>%
+    filter(!grepl("Placebo",Initial_status)) %>%
+    filter(PID %in% c("DEN1001A", "DEN1011A", "DEN1012A", "DEN1013A", "DEN1014A", "DEN1045A", "DEN1049A")) %>%
+    ggplot(aes(x = Day, y= titer)) +
+      geom_point(aes(colour=factor(PID), size=0.1, stroke = 0)) +
+      geom_line(aes(group=PID), size = 0.5) +
+      scale_x_continuous("Day", breaks=c(0,28,56,91,181,208,236,271)) +
+      scale_y_log10("nAB titers", limits=c(10,1e4), breaks = trans_breaks("log10", function(x) 10^x),
+                    labels = trans_format('log10',math_format(10^.x))) + 
+      theme_bw() +
+      labs(title = "DV1") + 
+      theme(axis.text=element_text(size=14),
+            axis.title=element_text(size=16))
+ggsave(DV1_sub, filename= "figures/DV1_titer_curve_subgroup.pdf", device = "pdf")
+
+DV1_DEN1013A <- outcome_df %>%  
+    filter(Initial_group == "A") %>%
+    filter(serotype == "DV1") %>%
+    filter(!grepl("Placebo",Initial_status)) %>%
+    filter(PID == "DEN1013A") %>%
+    ggplot(aes(x = Day, y= titer)) +
+      geom_point(aes(colour=factor(PID), size=0.1, stroke = 0)) +
+      geom_line(aes(group=PID), size = 0.5) +
+      scale_x_continuous("Day", breaks=c(0,28,56,91,181,208,236,271)) +
+      scale_y_log10("nAB titers", limits=c(10,1e4), breaks = trans_breaks("log10", function(x) 10^x),
+                    labels = trans_format('log10',math_format(10^.x))) + 
+      theme_bw() +
+      labs(title = "DV1") + 
+      theme(axis.text=element_text(size=14),
+            axis.title=element_text(size=16))
+ggsave(DV1_DEN1013A, filename= "figures/DV1_titer_curve_DEN1013A.pdf", device = "pdf")
+
+DV1_DEN1012A <- outcome_df %>%  
+    filter(Initial_group == "A") %>%
+    filter(serotype == "DV1") %>%
+    filter(!grepl("Placebo",Initial_status)) %>%
+    filter(PID == "DEN1012A") %>%
+    ggplot(aes(x = Day, y= titer)) +
+      geom_point(aes(colour=factor(PID), size=0.1, stroke = 0)) +
+      geom_line(aes(group=PID), size = 0.5) +
+      scale_x_continuous("Day", breaks=c(0,28,56,91,181,208,236,271)) +
+      scale_y_log10("nAB titers", limits=c(10,1e4), breaks = trans_breaks("log10", function(x) 10^x),
+                    labels = trans_format('log10',math_format(10^.x))) + 
+      theme_bw() +
+      labs(title = "DV1") + 
+      theme(axis.text=element_text(size=14),
+            axis.title=element_text(size=16))
+ggsave(DV1_DEN1012A, filename= "figures/DV1_titer_curve_DEN1012A.pdf", device = "pdf")
+
+
+
+naive_seroneg <- outcome_df_dichot %>%
+                filter(Vaccine_status == "Vaccine") %>%
+                filter(Immune_status_at_baseline == "Naive") %>%
+                filter(Group == "A") %>%
+                .$PID %>% unique(.)
+
+DV_facets <- outcome_df %>%  
+    filter(Initial_group == "A") %>%
+    filter(!grepl("Placebo",Initial_status)) %>%
+    filter(PID %in% naive_seroneg) %>%
+    ggplot(aes(x = Day, y= titer)) +
+      theme_bw() +
+      geom_point(size = 2, aes(colour=factor(PID), stroke = 0)) +
+      geom_line(aes(group=PID), size = 0.25) +
+      scale_x_continuous("Day", breaks=c(0,28,56,91,181,208,236,271)) +
+      scale_y_log10("nAB titers", limits=c(10,1e4), breaks = trans_breaks("log10", function(x) 10^x),
+                    labels = trans_format('log10',math_format(10^.x))) + 
+      theme(legend.position="none", 
+            axis.text=element_text(size=10),
+            axis.title=element_text(size=12)) +
+      facet_wrap(facets = ~ serotype) +
+      theme(strip.background =element_rect(fill="white", colour = "white")) +
+      theme(strip.text = element_text(colour = 'black', size = 12)) 
+  
+ggsave(DV_facets, filename= "figures/DV_titer_curve_all.pdf", device = "pdf", width = 7, height = 7)
+
+
+naive_seroneg_placeb <- outcome_df_dichot %>%
+                filter(Vaccine_status == "Placebo") %>%
+                filter(Immune_status_at_baseline == "Naive") %>%
+                filter(Group == "A") %>%
+                .$PID %>% unique(.)
+DV_facets_placebo <- outcome_df %>%  
+    filter(PID %in% naive_seroneg_placeb) %>%
+    ggplot(aes(x = Day, y= titer)) +
+      theme_bw() +
+      geom_point(size = 2, aes(colour=factor(PID), stroke = 0)) +
+      geom_line(aes(group=PID), size = 0.25) +
+      scale_x_continuous("Day", breaks=c(0,28,56,91,181,208,236,271)) +
+      scale_y_log10("nAB titers", limits=c(10,1e4), breaks = trans_breaks("log10", function(x) 10^x),
+                    labels = trans_format('log10',math_format(10^.x))) + 
+      theme(legend.position="none", 
+            axis.text=element_text(size=10),
+            axis.title=element_text(size=12)) +
+      facet_wrap(facets = ~ serotype) +
+      theme(strip.background =element_rect(fill="white", colour = "white")) +
+      theme(strip.text = element_text(colour = 'black', size = 12)) 
+  
+ggsave(DV_facets_placebo, filename= "figures/DV_titer_curve_all_placebos.pdf", 
+       device = "pdf", width = 7, height = 7)
+
+
+
+
+DV_facets_per_time <- outcome_df %>%  
+    filter(PID %in% naive_seroneg) %>%
+    mutate(combo = paste(PID, serotype, sep = "__")) %>%
+    full_join(., titer_summary_table_preprocess %>% 
+                 mutate(combo = paste(PID, serotype, sep = "__")) %>%
+                 dplyr::select(combo, Timepoint), by  = "combo") %>%
+    filter(timespan_check == "ok") %>%
+    mutate(Timepoint = ifelse(is.na(Timepoint),"NR", Timepoint)) %>%
+    dplyr::rename(Maxima_Timepoint = "Timepoint") %>%
+    mutate(Maxima_Timepoint = ifelse(Maxima_Timepoint == "NR", "NR",
+                                     paste("Day", as.character(Maxima_Timepoint), "Peak"))) %>% 
+    left_join(., outcome_df_dichot %>%
+                dplyr::select(PID, Cumulative_Breadth_dichot), by = "PID") %>%
+    dplyr::rename(Breadth = "Cumulative_Breadth_dichot") %>%
+    #filter(Maxima_Timepoint == "NA")
+    ggplot(aes(x = Day, y= titer)) +
+      theme_bw() +
+      geom_point(size = 2, aes(colour=factor(PID), shape = Breadth, stroke = 0)) +
+      geom_line(aes(group=PID), size = 0.25) +
+      scale_x_continuous("Day", breaks=c(0,28,56,91,181,208,236,271)) +
+      scale_y_log10("nAB titers", limits=c(10,1e4), breaks = trans_breaks("log10", function(x) 10^x),
+                    labels = trans_format('log10',math_format(10^.x))) + 
+      theme(legend.position="none", 
+            axis.text=element_text(size=10),
+            axis.text.x=element_text(angle = 45, vjust = 1, hjust=1),
+            axis.title=element_text(size=12)) +
+      facet_grid(facets = Maxima_Timepoint ~ serotype) +
+      #theme(strip.background =element_rect(fill="white", colour = "white")) +
+      theme(strip.text = element_text(colour = 'black', size = 12)) 
+  
+ggsave(DV_facets_per_time, filename= "figures/DV_titer_curve_all_timepoint_split.pdf", 
+       device = "pdf", width = 8.5, height = 10)
+
+
+```
+
+
+```{r durability assesment}
+durab_df <- outcome_df %>%  
+            filter(Initial_group == "A") %>%
+            filter(!grepl("Placebo",Initial_status)) %>%
+            inner_join(., outcome_df_final %>% dplyr::select(PID, Immune_status_at_baseline), by = "PID") %>%
+            dplyr::filter(Immune_status_at_baseline == "Naive") %>%
+            group_by(Day) %>%
+            mutate(n = n_distinct(PID)) %>%
+            ungroup() %>%
+            group_by(Day, serotype, n) %>%
+            summarise(seroconvert_n = sum(titer > 10)) %>%
+            ungroup() %>%
+            mutate(freq = round(seroconvert_n / n * 100, digits = 2)) %>%
+            mutate(seroconvert_metric = paste(seroconvert_n, " (", freq, "%)", sep = "" )) %>%
+            dplyr::select(Day, serotype, seroconvert_metric) %>%
+            spread(serotype, seroconvert_metric)
+
+durab_dist <- outcome_df %>%  
+            filter(Initial_group == "A") %>%
+            filter(!grepl("Placebo",Initial_status)) %>%
+            inner_join(., outcome_df_final %>% dplyr::select(PID, Immune_status_at_baseline), by = "PID") %>%
+            dplyr::filter(Immune_status_at_baseline == "Naive") %>%
+            mutate(seroconverted = ifelse(titer > 10, Day, NA)) %>%
+            filter(Day <= 180 ) %>%
+            group_by(PID, serotype) %>%
+            mutate(last_pos_day = ifelse(is.infinite(max(seroconverted, na.rm = T)), 0, max(seroconverted, na.rm = T))) %>%
+            ungroup() %>%
+            dplyr::filter(last_pos_day > 0)  %>%
+            dplyr::select(PID, serotype, last_pos_day) %>%
+            unique()
+
+durab_mean <- durab_dist %>%
+                group_by(serotype) %>%
+                summarise(mean = mean(last_pos_day)) %>%
+                ungroup() %>%
+                dplyr::rename(last_pos_day = "mean")
+durab_stats <- durab_dist %>%
+            tukey_hsd(aov(last_pos_day ~ serotype, data = .),)
+
+
+test <- ggplot(durab_dist, aes(x = serotype, y = last_pos_day)) + 
+                #geom_boxplot(outlier.shape = NA) + 
+                  geom_jitter(width = 0.15)
+                  geom_point(data = durab_mean, size = 6, aes(x = serotype, y = last_pos_day))
+            
+durab_stats_table <- durab_dist %>%
+                    dplyr::select()
+  
+
+nr_boost_check <- outcome_df %>%  
+            filter(Initial_group == "A") %>%
+            filter(!grepl("Placebo",Initial_status)) %>%
+            inner_join(., outcome_df_final %>% dplyr::select(PID, Immune_status_at_baseline), by = "PID") %>%
+            dplyr::filter(Immune_status_at_baseline == "Naive") %>%
+            mutate(seroconverted = ifelse(titer > 10, Day, NA)) %>%
+            filter(PID %in% nr_id_df$PID) %>%
+            #filter(Day <= 180 ) %>%
+            group_by(PID, serotype) %>%
+            summarise(max_post_boost = max(titer, na.rm = T)) %>%
+            ungroup() %>%
+            spread(serotype, max_post_boost)
+
+writeLines("non-responder_PIDs.txt", text = unique(nr_id_df$PID))
+  
+write_tsv(durab_df, file = "durability_across_serotypes_and_timepoints.tsv")
+
+```
+
+
+
+```{r auc_cross_corr}
+
+auc_pair_corr <- outcome_df_dichot %>% 
+        filter(PID %in% naive_seroneg) %>%
+        dplyr::select(DV1_AUCp_log,DV2_AUCp_log,DV3_AUCp_log,DV4_AUCp_log) %>%
+        drop_na() %>%
+        ggpairs(xlab = "Serotype-specific AUC", 
+                upper = list(continuous = "blank"),
+                diag = list(continuous = "blankDiag")) +
+        theme_bw()
+
+auc_pair_corr_stats <- rcorr(outcome_df_dichot %>% 
+        filter(PID %in% naive_seroneg) %>%
+        dplyr::select(DV1_AUCp_log,DV2_AUCp_log,DV3_AUCp_log,DV4_AUCp_log) %>%
+        drop_na() %>%
+        as.matrix() ,  )
+
+ggsave(auc_pair_corr, filename = "figures/auc_correlation_plot.pdf", width = 6, height = 6.5)
+
+
+
+auc_pair_corr_time <- outcome_df_dichot %>% 
+        filter(PID %in% naive_seroneg) %>%
+         dplyr::select(PID, DV1_AUCp_log,DV2_AUCp_log,DV3_AUCp_log,DV4_AUCp_log) %>%
+        gather(serotype_outcome, auc, 
+               colnames(outcome_df_dichot)[grepl("AUCp",colnames(outcome_df_dichot))]) %>%
+        mutate(serotype = gsub("_AUCp.*", "", serotype_outcome)) %>%
+        mutate(combo = paste(PID, serotype, sep = "__")) %>%
+        right_join(titer_summary_table_preprocess%>% 
+                 mutate(combo = paste(PID, serotype, sep = "__")) %>%
+                 dplyr::select(combo, Timepoint), by  = "combo") %>%
+        mutate(Timepoint = paste(serotype, "Day", as.character(Timepoint), "Peak", sep = " ")) %>%
+        dplyr::select(-serotype_outcome, -serotype, -combo) %>%
+        spread(Timepoint, auc) %>%
+        dplyr::select(-PID) %>%
+        as.matrix() %>%
+        
+
+library(Hmisc)
+cross_cor <- rcorr(auc_pair_corr_time, type = "spearman")
+      
+cross_cor$r[which(is.na(cross_cor$P))] <- NA
+cross_cor$r[which(cross_cor$P > 0.05)] <- 0
+corplot_auc_time <- corrplot(cross_cor$r, na.label = "square", na.label.col = "gray", 
+         addgrid.col = "black", type=  "upper")
+
+
+pdf("figures/auc_corrplot_pertime.pdf")
+corrplot(cross_cor$r, na.label = "square", na.label.col = "gray", 
+         addgrid.col = "black", type=  "upper", 
+         col = colorRampPalette(colors = c("blue", "white", "red"))(100))
+dev.off()
+
+
+ggsave(corplot_auc_time, filename = "figures/auc_corrplot.pdf")
+  
+  
+```
+Cumulative AUC with Hill equation approach:
+some valid concerns were raised about the use of the AUC as a measure of magnitude, as it does nto capture if a response is rapid, or delayed. A delayed response could behave differently than a rapid one in terms of protection, and immune response. Moreover, the AUC blends responses that have no persistence but high peaks vs with good persistence and lower peaks. The goal of this approach is to model how the % of the AUC accumulated over time and measure it using the Hill coefficient. 
+```{r }
+
+cumul_AUC <- function(x,timepointA, timepointB) {
+  cumul <- 0
+  df <- x %>% 
+    filter(Day >= timepointA & Day <= timepointB) %>%
+    arrange(Day) %>%
+    mutate(cumul_AUC = cumul)
+  total_AUC <- trapz(df$Day,df$titer)
+  cumul_list <- c(0)
+  for(i in 2:length(df$Day)){
+    auc_interval_perc <- trapz(c(df$Day[i-1],df$Day[i]),c(df$titer[i-1],df$titer[i])) / total_AUC
+    cumul_list[[i]] <- auc_interval_perc + max(cumul_list)
+  }
+  df$cumul_AUC <- cumul_list
+  print(df)
+  #df <- df[order(df$Day)]
+  return(df)
+}
+
+cumul_AUC_raw <- function(x,timepointA, timepointB) {
+  cumul <- 0
+  df <- x %>% 
+    filter(Day >= timepointA & Day <= timepointB) %>%
+    arrange(Day) %>%
+    mutate(cumul_AUC = cumul)
+  total_AUC <- trapz(df$Day,df$titer)
+  cumul_list <- c(0)
+  for(i in 2:length(df$Day)){
+    auc_interval_perc <- trapz(c(df$Day[i-1],df$Day[i]),c(df$titer[i-1],df$titer[i])) 
+    cumul_list[[i]] <- auc_interval_perc + max(cumul_list)
+  }
+  df$cumul_AUC <- cumul_list
+  print(df)
+  #df <- df[order(df$Day)]
+  return(df)
+}
+testlist <- c("DEN1001A", "DEN1011A", "DEN1012A", "DEN1013A", "DEN1014A", "DEN1045A", "DEN1049A")
+
+
+
+sigmoidfit <- function(x,ID,serotype,lower.int, high.int) {
+  outcome_df <- x
+  print(outcome_df)
+  test <- outcome_df[outcome_df$PID == ID,]
+  test <- test[test$serotype == serotype, ]
+  test <- test[order(test$Day),]
+  print(test$Day)
+  print(test$titer)
+  test2 <- cumul_AUC(test,lower.int,high.int)
+  print(test2$cumul_AUC)
+  test3 <- drm(cumul_AUC ~ Day, data= test2, fct=LL2.4())
+  ed50 <- ED(test3,50)
+  ed50_time <- exp(1)^ed50[1]
+  #print(summary(test3))
+  pdf(paste("figures/",ID,"_AUC_cumul.pdf"))
+  plot(test3)
+  dev.off()
+  return(ed50_time)
+}
+sigmoidfit_raw <- function(x,ID,serotype,lower.int, high.int) {
+  outcome_df <- x
+  print(outcome_df)
+  test <- outcome_df[outcome_df$PID == ID,]
+  test <- test[test$serotype == serotype, ]
+  test <- test[order(test$Day),]
+  test$Day
+  test$titer
+  test2 <- cumul_AUC_raw(test,lower.int,high.int)
+  test2$cumul_AUC
+  test3 <- drm(cumul_AUC ~ Day, data= test2, fct=LL2.4())
+  print(ED(test3,50))
+  print(summary(test3))
+  #print(test3)
+  pdf(paste("figures/",ID,"_AUC_cumul_raw.pdf"))
+  plot(test3)
+  dev.off()
+  
+}
+
+for(i in testlist){
+  print(i)
+  print(sigmoidfit(outcome_df,i, "DV1", 0, 181))
+  #sigmoidfit_raw(outcome_df,i, "DV1", 0, 181)
+}
+
+
+
+ed50 <- sigmoidfit(outcome_df,testlist[3],"DV1", 0, 181)
+
+#plot(test2$Day,test2$cumul_AUC)
+
+# test2 <- test2[c("Day","cumul_AUC")] %>% as.data.frame()
+# colnames(test2) <- c("time","intensity")
+# normalizedInput <- sicegar::normalizeData(test2, dataInputName = "testing")
+# 
+# sigmoidalModel <- sicegar::multipleFitFunction(dataInput = normalizedInput,
+#                                               model = "sigmoidal",
+#                                               n_runs_min = 20,
+#                                               n_runs_max = 500,
+#                                               showDetails = FALSE)
+# sigmoidalModel <- sicegar::sigmoidalFitFunction(dataInput = test2, tryCounter = 2)
+# 
+# figureModelCurves(test2)
+# testing <- fitAndCategorize(normalizedInput)
+
+
+
+```
+
+
+Patient reclassification: Some patient that were in Group A or Group B from initial Ab titer screenings seem to have been misclassified upon reexamination of titers with more sensitive techniques. 
+The goal of this chunk is to reclassify them in the appropriate cohort.
+```{r }
+patient_class_df <- outcome_df %>%
+  filter(Day == 0) %>%
+  dplyr::select(-Legend, -...1, -Visit_code) 
+
+revised_patient_info <- patient_class_df %>%
+  #filter(Initial_group == "A") %>%
+  group_by(PID) %>%
+  mutate(pos_check = ifelse(titer >10, 1, 0)) %>%
+  arrange(PID) %>%
+  mutate(pos_check_sum = sum(pos_check)) %>%
+  mutate(Revised_group = ifelse(pos_check_sum >0, "B", "A")) %>%
+  mutate(Revised_status_temp = ifelse(pos_check > 0 , paste(serotype,"immune",sep="_"),"Naive")) %>%
+  mutate(Revised_immune_status_before_vac = paste(Revised_status_temp[pos_check ==1], collapse=", ")  ) %>% 
+  mutate(Revised_immune_status_before_vac = ifelse(pos_check_sum == 0, 
+                                                   "Naive", 
+                                                   Revised_immune_status_before_vac)) %>%
+  as.data.frame(.) %>%
+  mutate(Vaccine_status = ifelse(grepl("Placebo", Initial_status ),"Placebo","Vaccine")) %>%
+  dplyr::select(-pos_check,-pos_check_sum, -titer,-serotype,-Day,-Revised_status_temp, 
+                -Revised_group, -Initial_status) %>%
+  rename(Immune_status_at_baseline = "Revised_immune_status_before_vac") %>%
+  rename(Group = "Initial_group") %>%
+  unique(.)
+
+# row.names(revised_patient_info) <- NULL
+# kable(revised_patient_info) %>%
+#   kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+
+revised_patient_info
+```
+AUC dichotomizing process 
+This will be useful in GSEA analysis to make contrasts
+In absence of a set threshold for dichotomization, another method was chosen:
+Dichotomization process is done by quantifying AUC median accross the vaccine group: values under the median were considered to have a low AUC, and values above a high AUC. This was done separately for preboost and postboost. 
+``` {r }
+# AUC_up <- merge(revised_patient_info, AUC, by="PID")
+# AUC_up <- AUC_up %>%
+#   dplyr::select(-Revised_group, -Initial_status, -Revised_immune_status_before_vac) %>%
+#   filter(Vaccine_status == "Vaccine") %>%
+#   gather(AUC,value, -PID,-Initial_group,-Vaccine_status) %>%
+#   group_by(AUC, Initial_group) %>%
+#   mutate(AUC_med = median(value, na.rm=TRUE)) %>%
+#   ungroup(.) %>%
+#   mutate(new_ids = paste(AUC,"lowhi", sep="_")) %>%
+#   mutate(lowhi = ifelse(value <= AUC_med, "low","high")) %>%
+#   dplyr::select(-AUC,-value,-AUC_med,-Vaccine_status, -Initial_group) %>%
+#   spread(new_ids,lowhi)
+#   
+# AUC_up <- merge(AUC,AUC_up, by="PID", all.x = TRUE)
+
+```
+
+All dataframes were then bound together and exported to a text file for downstream analyses and sharing
+```{r }
+outcome_df_final <- merge(revised_patient_info,AUC, by="PID")
+outcome_df_final <- merge(outcome_df_final, breadth_df, by="PID")
+outcome_df_final <- merge(outcome_df_final, AUC_nontr, by = "PID")
+#write.table(outcome_df_final,file="DV_outcomes_09282018_ANP.txt", sep="\t", row.names = FALSE, quote = FALSE)
+#write.table(outcome_df_final,file="DV_outcomes_02152019_ANP.txt", sep="\t", row.names = FALSE, quote = FALSE)
+
+#New version corrects AUC for some patients that did not have measurements at all timepoints
+write.table(outcome_df_final,file="DV_outcomes_04292019_ANP.txt", sep="\t", row.names = FALSE, quote = FALSE)
+
+
+# write.table(outcome_df_final,file="DV_outcomes_06062018_ANP.txt", sep="\t", row.names = FALSE, quote = FALSE) 
+
+```
+
+UPDATE : April 24th 2019, it was decided that breadth was going to be a dichotomous variable, and that we would correlate with viremia post boost to measure efficacy of vaccination. 
+
+The idea is that patients with a breadth of 4, even if undetectable at later time points, would be able to neutralize all 4 serotypes, and as such, no viremia would be observed post boost. 
+
+```{r breadth_dichotimization}
+
+outcome_df_dichot <- outcome_df_final %>%
+                gather(outcome, value, contains("Breadth")) %>%
+                filter(!grepl("lowhi",outcome )) %>%
+                filter(!grepl("D0_|D180_|D208_|D236_|D271_", outcome)) %>%
+                gather(AUC_outcome, AUC_value, contains("AUC")) %>%
+                filter(!grepl("AUCb", AUC_outcome)) %>%
+                filter(grepl("log", AUC_outcome)) %>%
+                spread(AUC_outcome, AUC_value) %>%
+                group_by(PID) %>%
+                mutate(culmin_breadth = max(value)) %>%
+                ungroup(.) %>%
+                mutate(Cumulative_Breadth_dichot = ifelse(culmin_breadth == 4, "high", 
+                                               ifelse(is.na(culmin_breadth), NA , "low"))) %>%
+                filter(outcome == "D91_Breadth") %>% 
+                mutate(dichot_d91_value = ifelse(value == 4, "high", 
+                                               ifelse(is.na(value), NA , "low"))) %>%
+                spread(outcome, dichot_d91_value) %>%
+                dplyr::select(-value, -culmin_breadth) %>%
+                distinct(.) %>%
+                #filter(Group == "A") %>%
+                # filter(Immune_status_at_baseline == "Naive") %>%
+                # filter(Vaccine_status == "Vaccine") %>%
+                rename(D91_Breadth_dichot = "D91_Breadth") %>%
+                # filter(timespan_check == "ok") %>%
+                dplyr::select(-timespan_check)
+                
+
+outcome_df_dichot_long <- outcome_df_final %>% ## testing to see if breadth is affected by the boost vs only the prime
+                gather(outcome, value, contains("Breadth")) %>%
+                filter(!grepl("lowhi",outcome )) %>%
+                filter(!grepl("D0_", outcome)) %>%
+                gather(AUC_outcome, AUC_value, contains("AUC")) %>%
+                filter(!grepl("AUCb", AUC_outcome)) %>%
+                filter(grepl("log", AUC_outcome)) %>%
+                spread(AUC_outcome, AUC_value) %>%
+                group_by(PID) %>%
+                mutate(culmin_breadth = max(value, na.rm = T)) %>%
+                ungroup(.) %>%
+                mutate(Cumulative_Breadth_dichot_long = ifelse(culmin_breadth == 4, "high", 
+                                               ifelse(is.na(culmin_breadth), NA , "low"))) %>%
+                filter(Group == "A" & Immune_status_at_baseline == "Naive" & Vaccine_status == "Vaccine") %>%
+                dplyr::select(PID, Cumulative_Breadth_dichot_long) %>%
+                unique() #%>%
+                # 
+                # dplyr::select(PID)
+                filter(outcome == "D91_Breadth") %>% 
+                mutate(dichot_d91_value = ifelse(value == 4, "high", 
+                                               ifelse(is.na(value), NA , "low"))) %>%
+                spread(outcome, dichot_d91_value) %>%
+                dplyr::select(-value, -culmin_breadth) %>%
+                distinct(.) %>%
+                #filter(Group == "A") %>%
+                # filter(Immune_status_at_baseline == "Naive") %>%
+                # filter(Vaccine_status == "Vaccine") %>%
+                rename(D91_Breadth_dichot = "D91_Breadth") %>%
+                # filter(timespan_check == "ok") %>%
+                dplyr::select(-timespan_check)
+                
+
+outcome_df_dichot
+
+write.table(outcome_df_dichot, "DV_outcomes_05082019_ANP.txt", row.names = FALSE, quote = FALSE, sep = "\t")
+
+
+                
+
+
+```
+
+
+
+```{r breadth_summary}
+
+outcome_breadth_summ <- outcome_df_final %>%
+   dplyr::select(PID, Group, Immune_status_at_baseline, Vaccine_status ) %>%
+    inner_join(., outcome_df, by = "PID") %>%
+    filter(Group == "A") %>%
+    filter(Vaccine_status == "Vaccine") %>%
+    filter(Immune_status_at_baseline == "Naive") %>%
+    filter(Day <= 91) %>%
+    group_by(PID, serotype) %>%
+    mutate(cumul_pos = ifelse(max(titer)  > 10, 1, 0)) %>%
+    ungroup() %>%
+    dplyr::select(PID, serotype, cumul_pos) %>%
+    unique() %>%
+    group_by(serotype) %>%
+    ungroup() %>%
+    group_by(PID) %>%
+    mutate(responder = ifelse(max(cumul_pos) == 1, "Responder", "Non-responder")) %>%
+    ungroup() %>%
+    mutate(keep = ifelse(cumul_pos  == 1 | responder == "Non-responder", 1, 0)) %>%
+    mutate(serotype = ifelse(responder == "Non-responder", responder, serotype)) %>%
+    filter(keep == 1) %>%
+    unique() %>%
+    split(., f = .$serotype)
+    
+
+outcome_breadth_serotypes <- sapply(names(outcome_breadth_summ), simplify = F, USE.NAMES = T, function(x){
+   out <- outcome_breadth_summ[[x]] %>%
+            .$PID
+   return(out)
+})
+
+library(RColorBrewer)
+venn.diagram(outcome_breadth_serotypes, filename = "figures/venn_breadth_serotypes.tiff", 
+             fill = brewer.pal(8, "Dark2")[c(1:4)], alpha = 0.5, cat.col = brewer.pal(8, "Dark2")[c(1:4)], 
+             res = 300, width = 900, height = 900)
+
+
+upset_comb <- make_comb_mat(outcome_breadth_serotypes, mode = "intersect")
+
+comb_order_df <- cbind(as.data.frame(comb_size(upset_comb)), as.data.frame(comb_degree(upset_comb))) %>%
+                  rownames_to_column("combination") %>%
+                  dplyr::rename(size = 2,
+                                degree = 3) %>%
+                  mutate(rank = row_number()) %>%
+                  arrange(desc(size), degree)
+  
+upset_dv_response <- UpSet(upset_comb, 
+              comb_order = comb_order_df$rank, 
+              set_order = names(outcome_breadth_serotypes),
+              #top_annotation = upset_top_annotation(upset_comb, add_numbers = T),
+              top_annotation = upset_top_annotation(upset_comb, add_numbers = T),
+              right_annotation = NULL, 
+              comb_col = c("black", "blue", "purple", "red")[comb_degree(upset_comb)])
+upset_lgd <- list(Legend(at = order(unique(comb_degree(upset_comb)), decreasing = T), title = "Degrees", 
+                                        legend_gp = gpar(fill = c("black", "blue", "purple", "red"))))
+
+svg("upset_plot_response.svg", width = 10, height = 4)
+draw(upset_dv_response, ht_gap = unit(7, "mm"), annotation_legend_list = upset_lgd)
+dev.off()
+# 
+# nr_id_df <- outcome_df_final %>%
+#    dplyr::select(PID, Group, Immune_status_at_baseline, Vaccine_status ) %>%
+#     inner_join(., outcome_df, by = "PID") %>%
+#     filter(Group == "A") %>%
+#     filter(Vaccine_status == "Vaccine") %>%
+#     filter(Immune_status_at_baseline == "Naive") %>%
+#     filter(Day <= 91) %>%
+#     group_by(PID, serotype) %>%
+#     mutate(cumul_pos = ifelse(max(titer)  > 10, 1, 0)) %>%
+#     ungroup() %>%
+#     dplyr::select(PID, serotype, cumul_pos) %>%
+#     unique() %>%
+#     group_by(serotype) %>%
+#     ungroup() %>%
+#     filter(cumul_pos != 1) %>%
+#     group_by(PID) %>%
+#     mutate(nr = sum(cumul_pos == 0)) %>%
+#     ungroup() %>%
+#     filter(nr == 4) 
+
+
+```
+
+Calculation of viremia per timepoint: tis data is problematic. No viremia is seen in the vast majority of patients post boost (which is in line with our hypothesis), but no viremia is observed at the first immuniztion either. This suggests that this assay cannot really inform us whether the measure of viremia post boost can be used as a surrogate of protection. 
+
+Either viremia clears really quickly (<3 days) or the assay is not sensitive enough to detect it in the first place. 
+```{r viremia_calc}
+
+library(janitor)
+viremia_raw <- read_excel(path = "DEN-01-IB _Viremia.xlsx", sheet = "final", col_names = FALSE) %>%
+            clean_names() %>%
+            gather(temp_col, merged) %>%
+            separate(merged, into = c("PID", "Timepoint","Serotype", "Viremia"), sep = "_") %>%
+            mutate(PID = paste("DEN",PID,"A", sep = "")) %>%
+            mutate(Viremia = gsub("!!", "", Viremia)) %>%
+            mutate(Sero_time = paste(Timepoint, Serotype, sep = "_")) %>%
+            dplyr::select(-temp_col, -Serotype) 
+            
+viremia_table <- viremia_raw %>%
+            dplyr::select(-Timepoint) %>%
+            mutate(Sero_time = paste("Viremia", Sero_time, sep = "_")) %>%
+            spread(Sero_time, Viremia)
+
+viremia_summary <- viremia_raw %>%
+            filter(Viremia != "NA") %>%
+            group_by(Sero_time) %>%
+            mutate(total_count = sum(!is.na(Viremia))) %>% ungroup() %>%
+            group_by(Sero_time, Viremia) %>%
+            mutate(status_count = sum(!is.na(Viremia))) %>%
+            mutate(percent = status_count / total_count * 100) %>%
+            ungroup(.) %>%
+            group_by(Timepoint, PID) %>%
+            mutate(tally_negatives = as.character(sum(Viremia == "NEGATIVE"))) %>%
+            ungroup(.) %>%
+            group_by(Timepoint, tally_negatives) %>%
+            mutate(perc_total = n()/4/total_count *100 ) %>%
+            dplyr::select(-PID) %>% distinct()
+viremia_summary_merged <- viremia_summary %>%
+            dplyr::select(Timepoint, tally_negatives, perc_total ) %>%
+            rename(n.negatives.vir = "tally_negatives") %>%
+            distinct() %>% ungroup()
+
+plot_viremia <- ggplot(viremia_summary_merged, aes(x = Timepoint, y = perc_total)) +
+            geom_point(aes(colour=factor(n.negatives.vir), size=0.1, stroke = 0)) +
+            geom_line(aes(group=n.negatives.vir), size = 0.5) +
+            theme_bw()
+
+plot(plot_viremia)
+
+
+
+```
+
+
+```{r titer_pca}
+titer_summary <- outcome_df %>%  
+    filter(Initial_group == "A") %>%
+    filter(!grepl("Placebo",Initial_status)) %>%
+    filter(PID %in% outcome_df_dichot$PID) %>%
+    mutate(SeroDay = paste(serotype, "_D", Day, sep = ""))  %>%
+    filter(Day <= 91) %>%
+    filter(Day > 0) %>%
+    dplyr::select(PID, SeroDay, titer) %>%
+    inner_join(., outcome_df_dichot, by = "PID") %>%
+    filter(grepl("Naive",Immune_status_at_baseline)) %>%
+    dplyr::select(PID, SeroDay, titer) %>%
+    unique() %>%
+    spread(PID, titer) %>%
+    gather(PID, titer, -SeroDay) %>%
+    group_by(PID) %>%
+    mutate(na_count = sum(is.na(titer))) %>%
+    ungroup() %>%
+    filter(na_count == 0) %>%
+    dplyr::select(-na_count) %>%
+    spread(PID, titer) %>%
+    column_to_rownames("SeroDay") %>%
+    as.matrix()
+  
+pData_titers <- outcome_df_dichot %>%
+                  filter(PID %in% colnames(titer_summary)) %>%
+                  column_to_rownames("PID")
+
+eset_titers <- ExpressionSet(assayData = titer_summary,
+                             phenoData = AnnotatedDataFrame(pData_titers))
+
+
+pca_func <- function(eset){
+  mat <- scale(t(exprs(eset)), center = T)
+  pca <- summary(prcomp(mat))
+  
+  importance <- pca$importance 
+  importance_df <- t(importance) %>%
+                    as.data.frame() %>%
+                    rownames_to_column("PC") 
+  
+  elbow <- findElbowPoint(importance_df$`Standard deviation`^2)
+  #elbow <- colnames(importance)[findElbowPoint(importance_df$`Standard deviation`^2)]
+  
+  #elbowPC <- colnames(importance)[]
+  
+  holm <- parallelPCA(mat)$n
+  
+  scree <- ggplot(importance_df, aes(x = reorder(PC,-`Proportion of Variance`) , y = `Proportion of Variance` )) + 
+            geom_bar(stat = "identity") +
+            geom_point(data = importance_df, aes(x = reorder(PC,-`Proportion of Variance`), 
+                                                 y = `Cumulative Proportion`),
+                       size = 0.5) +
+            stat_smooth(data = importance_df, aes(x = reorder(PC,-`Proportion of Variance`), 
+                                                 y = `Cumulative Proportion`), method = "loess") + 
+            #geom_smooth(data = importance_df, aes)
+            geom_vline(xintercept =  elbow, linetype = "dashed") + 
+            geom_vline(xintercept =  holm, linetype = "dashed") + 
+            geom_text(aes(elbow - 2, 0.75, label = "Elbow", vjust = -1)) + 
+            geom_text(aes(holm + 2, 0.75, label = "Holm", vjust = -1)) + 
+            theme_bw() +
+            theme(axis.text.x = element_text(angle = 90 ))
+  
+  
+
+  pca_df <- pca$x %>%
+            as.data.frame() %>%
+            rownames_to_column("SampleID") %>%
+            inner_join(., pData(eset) %>% rownames_to_column("SampleID"), by  = "SampleID") %>%
+            dplyr::select(colnames(pca$x), SampleID, everything())
+  
+  out <- list("pca_df" = pca_df, "importance" = importance, "scree" = scree, "loadings" = pca$rotation)
+
+  return(out)
+}
+
+
+
+pca_plot <- function(pca_object, color = NULL, shape = NULL, size = NULL, dims = c(1,2),
+                     title = NULL){
+   pca_df <- pca_object$pca_df
+
+    p <- ggplot(data = pca_df, 
+                aes_string(colnames(pca_df)[dims[1]],
+                           colnames(pca_df)[dims[2]],
+                           colour = color,
+                           shape = shape,
+                           size = size)) +
+            geom_point() + 
+            xlab(paste(colnames(pca_df)[dims[1]], " (",
+                       round(pca_object$importance[2,dims[1]], digits = 4) * 100,
+                       ") %", sep = "")) +  
+            ylab(paste(colnames(pca_df)[dims[2]], " (",
+                       round(pca_object$importance[2,dims[2]], digits = 4) * 100,
+                       ") %", sep = "")) + 
+             theme_bw()  +
+            ggtitle(title)
+  return(p)
+}
+
+
+
+pca_titers <- pca_func(eset = eset_titers)
+
+
+pca_plot_titers <- list()
+library(viridis)
+for(i in colnames(outcome_df_final)[grepl("AUCp_log", colnames(outcome_df_final))]){
+  pca_plot_titers[[i]]  <- pca_plot(pca_titers, color = i, shape = "Cumulative_Breadth_dichot",
+                                    size = 4) +
+             scale_color_viridis( )
+}
+
+pdf(file = "titer_pca_plot.pdf", width = 9)
+pca_plot_titers
+dev.off()
+
+
+
+
+
+
+```
+
+
+
+```{r auc_vs_breadth}
+
+total_comparison <- outcome_df_dichot %>%
+          filter(Group == 'A') %>%
+          filter(Immune_status_at_baseline == 'Naive') %>%
+          filter(Vaccine_status == 'Vaccine') %>%
+          filter(!is.na(Cumulative_Breadth_dichot)) %>%
+          dplyr::select(-D91_Breadth_dichot, -Vaccine_status, 
+                        -Immune_status_at_baseline, -Group) %>%
+          dplyr::rename(Breadth = 'Cumulative_Breadth_dichot') %>%
+          gather(serotype, AUC, -PID, -Breadth) %>%
+          ggviolin(., x = "Breadth", y = "AUC",
+                    color = "Breadth",
+                    add = "dotplot") +
+          stat_compare_means(method = 'wilcox.test', label = 'p.format', label.x = 1.5) +
+          theme_bw() +
+          ylab(label = 'Serotype-specific titer AUC') +
+          xlab(label = 'Breadth') +
+          facet_wrap(~serotype, nrow = 1, ncol = 4)
+
+ggsave(total_comparison, filename = 'figures/AUC_vs_breaddth_total.pdf', width = 11,
+       height =  3)
+
+total_comparison_resp <- outcome_df_dichot %>%
+          filter(Group == 'A') %>%
+          filter(Immune_status_at_baseline == 'Naive') %>%
+          filter(Vaccine_status == 'Vaccine') %>%
+          filter(!is.na(Cumulative_Breadth_dichot)) %>%
+          dplyr::select(-D91_Breadth_dichot, -Vaccine_status, 
+                        -Immune_status_at_baseline, -Group) %>%
+          gather(serotype, AUC, -PID, -Cumulative_Breadth_dichot) %>%
+          group_by(serotype) %>%
+          mutate(resp_check = ifelse(AUC == min(AUC), 1, 0)) %>%
+          ungroup() %>%
+          group_by(PID) %>%
+          mutate(sum_check = sum(resp_check)) %>%
+          ungroup() %>%
+          filter(sum_check < 4) %>%
+          ggviolin(., x = "Cumulative_Breadth_dichot", y = "AUC",
+                    color = "Cumulative_Breadth_dichot",
+                    add = "dotplot") +
+          stat_compare_means(method = 'wilcox.test', label = 'p.signif', label.x = 1.5) +
+          theme_bw() +
+          ylab(label = 'Serotype-specific titer AUC') +
+          xlab(label = 'Breadth') +
+          facet_wrap(~serotype, nrow = 1, ncol = 4)
+
+ggsave(total_comparison_resp, filename = 'figures/AUC_vs_breaddth_responders.pdf', width = 11,
+       height =  3)
+
+
+outcome_logit_prep <-   outcome_df_dichot %>%
+                        filter(Group == 'A') %>%
+                        filter(Immune_status_at_baseline == 'Naive') %>%
+                        filter(Vaccine_status == 'Vaccine') %>%
+                        filter(!is.na(Cumulative_Breadth_dichot)) %>%
+                        dplyr::select(-D91_Breadth_dichot, -Vaccine_status, 
+                                      -Immune_status_at_baseline, -Group) %>%
+                        dplyr::rename(Breadth = 'Cumulative_Breadth_dichot') %>%
+                        mutate(Breadth = ifelse(Breadth == "high", 1, 0)) %>%
+                        gather(serotype, auc, -PID, -Breadth) %>%
+                        group_by(serotype) %>%
+                        do(model = t.test(.$auc ~ .$Breadth, var.equal = FALSE)) %>%
+                        tidy(., model)
+
+  
+            
+
+
+outcomes_vs_auc_logit <- sapply(names(outcome_logit_prep), simplify = F, USE.NAMES = T, function(x){
+  
+  model <- glm(Breadth ~ auc, 
+            data = outcome_logit_prep[[x]], 
+            family = "binomial"
+            )
+  out <- summary(model)
+})
+
+
+outcome_28 <- outcome_df
+
+outcome_28
+
+
+```
+
+
+
+```{r outcome day 28}
+
+outcome_28 <- outcome_df
+
+outcome_28
+
+
+
+
+```
+
+
+```{r titer_summary}
+
+titer_summary_table_preprocess <-  outcome_df %>%  
+    filter(Initial_group == "A") %>%
+    filter(!grepl("Placebo",Initial_status)) %>%
+    filter(PID %in% colnames(titer_summary)) %>%
+    #mutate(SeroDay = paste(serotype, "_D", Day, sep = ""))  %>%
+    filter(Day <= 91) %>%
+    filter(Day > 0) %>%
+    filter(titer > 10) %>%
+    group_by(PID, serotype) %>%
+    mutate(max_titer = max(titer)) %>%
+    mutate(Timepoint = as.character(ifelse(titer == max_titer, Day, NA))) %>%
+    mutate(n_max = sum(!is.na(Timepoint))) %>%
+    ungroup() %>%
+    filter(!is.na(Timepoint)) %>%
+    group_by(PID, serotype) %>%
+    mutate(Timepoint = ifelse(n_max > 1 , min(Timepoint), Timepoint)) %>%
+    ungroup() %>%
+    dplyr::select(PID, serotype, max_titer, Timepoint) %>%
+    unique() 
+  
+wr
+
+titer_summary_table <-  titer_summary_table_preprocess  %>%
+          mutate(n = n_distinct(PID)) %>%
+          group_by(serotype, Timepoint) %>%
+          mutate(n_timepoint = n_distinct(PID)) %>%
+          mutate(freq_timepoint = round(n_timepoint / n, digits = 3) * 100) %>%
+          mutate(ratio = paste(n_timepoint, " (", freq_timepoint, "%)", sep = "")) %>%
+          ungroup() %>%
+          dplyr::select(serotype, Timepoint, ratio, n ) %>%
+          unique() %>%
+          mutate(Timepoint = paste("Day ", Timepoint, " Peak", sep = "")) %>%
+          spread(Timepoint, ratio) %>%
+          dplyr::select(serotype, `Day 28 Peak`,`Day 56 Peak`, `Day 91 Peak`, n)
+
+write.table(x = titer_summary_table, "titer summary table.txt", sep = "\t", quote = F, 
+            row.names = F)
+
+
+
+titer_summary_table_aligned <-  titer_summary_table_preprocess  %>%
+                  group_by(PID) %>%
+                  mutate(`Number of maxima` = n_distinct(Timepoint)) %>%
+                  ungroup() %>%
+                  dplyr::select(PID, `Number of maxima`) %>%
+                  mutate(n = n_distinct(PID)) %>%
+                  group_by(`Number of maxima`) %>%
+                  mutate(n_peaks_time = n_distinct(PID)) %>%
+                  mutate(freq_n_peaks = round(n_peaks_time/ n, digits = 3) * 100) %>%
+                  mutate(`n (relative proportion)` = paste(n_peaks_time,  " (", 
+                                                           freq_n_peaks, "%)", sep = "")) %>%
+                  dplyr::select(`Number of maxima`, `n (relative proportion)`) %>%
+                  unique() %>%
+                  arrange(`Number of maxima`) %>%
+                  ungroup()
+                
+write.table(x = titer_summary_table_aligned, "maxima_alignment table.txt", sep = "\t", quote = F, row.names = F)
+```
+
+
+```{r unsupervised pca}
+
+
+```
+
+
+
+```{r omic_compilation}
+compil_files <- list('transcriptomics' = '../RNA_Seq/output/data/transcript_patient_compil.txt',
+      'proteomic' = '../Caprion_proteomics_metab/Caprion_proteomics/output/data/compil_PID_proteomic.txt',
+      'mesoscale' = '../Mesoscale/output/data/msd_compil.txt',
+      'flow' = '../FACS/Baseline_experiment/tSNE_2/output/flow_compil_PID.txt')
+
+compiled_omics <- do.call('rbind', lapply(compil_files, function(x){
+  df <- read_tsv(x) %>%
+        mutate(flag = 1)
+})) %>%
+  spread(omic, flag) %>%
+  gather(omic, flag, -PID) %>%
+  mutate(flag = ifelse(is.na(flag), 0, flag)) %>%
+  spread(omic, flag) %>%
+  arrange(PID)
+
+```
+
+
+
+```{r outcomes_extended_cohort}
+
+extended_samples <- readxl::read_xlsx("Vials - Dengue Vaccine - serum samples from V1 visit.xlsx") %>%
+                    mutate(ID = gsub("[AB]", "", ID)) %>%
+                    mutate(ID = gsub(" .*", "", ID)) %>%
+                    mutate(Group = ifelse(as.numeric(ID) > 2000, "B", "A")) %>%
+                    mutate(ID = paste(Prefix, ID, Group, sep = "")) %>%
+                    left_join(., all_PID_extra, by = "ID") 
+
+naive_extended_ls <- extended_samples %>%
+                      dplyr::filter(Immune_status_at_baseline == "Naive") %>%
+                      mutate(PID_num = as.numeric(gsub("DEN", "", gsub("[AB]", "", ID)))) %>%
+                      dplyr::filter(!grepl("Placebo", Status)) %>%
+                      dplyr::filter(Group == "A") %>%
+                      dplyr::filter(!grepl("INC", Status)) %>%
+                      group_by(Breadth_dichot) %>%
+                      mutate(n_patients = n_distinct(ID)) %>%
+                      ungroup() %>%
+                      mutate(min_n  = min(n_patients)) #%>%
+table(naive_extended_ls$Breadth_dichot)
+
+naive_extended_sample_full <- naive_extended_ls %>%
+                                  mutate(firstRun = ifelse(PID_num < 1050, 1, 0)) %>%
+                                  dplyr::select(ID, Breadth_dichot, firstRun) %>%
+                                  arrange(Breadth_dichot, ID)
+write_csv(naive_extended_sample_full, "extended_cohort_sample_selection_full.csv")
+
+
+naive_extended_sample_random <- naive_extended_ls %>%
+                      group_by(Breadth_dichot) %>%
+                      slice_sample(., n = unique(naive_extended_ls$min_n) ) %>%
+                      ungroup() %>%
+                      dplyr::select(ID, Breadth_dichot)  ### include 3 old samples
+write_csv(naive_extended_sample_random, "extended_cohort_sample_selection_random.csv")
+                      
+
+
+
+
+```

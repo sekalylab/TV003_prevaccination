@@ -1,0 +1,974 @@
+---
+title: "tSNE_analysis"
+author: "Adam Pelletier"
+date: "11/20/2018"
+output: 
+  html_document:
+    df_print: paged
+---
+@ Adapted for parameterization from Ashish Sharma version.
+@ Added plotting options
+@ Added regression and statistical testing. 
+```{r setup, message = FALSE, warning=FALSE}
+#### Load required packages for analysis
+## Some packages may require installation from Bioconductor : "https://bioconductor.org/install/" 
+#suppressPackageStartupMessages(library(rstudioapi))
+suppressPackageStartupMessages(library(rmarkdown))
+suppressPackageStartupMessages(library(plyr))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(purrr))
+suppressPackageStartupMessages(library(tidyr))
+suppressPackageStartupMessages(library(pheatmap))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(tibble))
+suppressPackageStartupMessages(library(broom))
+suppressPackageStartupMessages(library(kableExtra))
+suppressPackageStartupMessages(library(ggplus))
+suppressPackageStartupMessages(library(MASS))
+
+suppressPackageStartupMessages(library(RColorBrewer))
+suppressPackageStartupMessages(library(Rtsne))
+suppressPackageStartupMessages(library(igraph))
+suppressPackageStartupMessages(library(FNN))
+suppressPackageStartupMessages(library(ggrepel))
+suppressPackageStartupMessages(library(lars))
+suppressPackageStartupMessages(library(forcats))
+suppressPackageStartupMessages(library(snowfall))
+suppressPackageStartupMessages(library(stringr))
+suppressPackageStartupMessages(library(ggpubr))
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(getwd())
+```
+
+
+
+### Setup directories 
+
+``` {r dirSetup}
+setup_dir <- function(dir_string) { 
+  ### Verifies creates a directory if it doesn't exist. Returns the dir_path
+  if (dir.exists(dir_string)){
+    dir_set <- dir_string
+  } else {
+    dir.create(dir_string) 
+    dir_set <- dir_string
+  }
+  return(dir_set)
+}
+
+inputDir <- setup_dir("input")
+fcsDir <- setup_dir(file.path(inputDir,"FCS"))
+
+
+outputDir <- setup_dir("output")
+figureDir <- setup_dir(file.path(outputDir,"figures"))
+
+univariate_dir <- setup_dir(file.path(figureDir,"univariate_regression"))
+wilcox_dir <- setup_dir(file.path(figureDir,"wilcox.test"))
+```
+
+
+## Correlate tSNE clusters with DV outcomes
+
+This part is project-specific: The idea is just to have a dataframe with information about the patients, including outcomes.
+```{r load_outcome_df}
+outcome_df <- read.table("../../../outcomes/DV_outcomes_09282018_ANP.txt",
+                         sep="\t",
+                         stringsAsFactors = FALSE,
+                         header = TRUE) %>%
+              mutate(Immune_status_at_baseline = ifelse(Immune_status_at_baseline == "Naive", "Naive", "Immune")) %>% as.data.frame(.)
+outcome_list <- colnames(outcome_df)[5:28]  # generate a list of the outcomes 
+
+outcome_df
+
+vac_PID <- outcome_df %>%
+  filter(Vaccine_status == "Vaccine") %>%
+  # filter(Immune_status_at_baseline == "Naive") %>%
+  dplyr::select(PID)
+
+```
+
+
+### Subsample files from CSV.
+Generalized function to subsample csv files, compatible with any panel, and generate an object usable for the tsne function below.
+Parameters:
+*fcsDir is a parameter to assign which directory the data is in.
+*population defines the name of your panel, population, etc.
+*exclude_vars takes a vector of channel names you wish to exclude form the tSNE, such as FSC.A, or Time. 
+* subsample is the number of events to take from each sample for the tSNE analysis: note that fewer events may be subsampled if the total number of events in a file is lower than the set threshold.Defaults at 1500 events.
+* min_events is the minimal size for a sample to be used in the analysis. Any file smaller than this will be discarded. Defaults at 500 events. 
+* filter_list allows you to pass a vector of sample ID to filter from the total list. 
+
+* sample_id_pattern takes a REGEX to extract patient names from filenames. For instance, "DEN[0-9]+A" will identify a pattern of "DENxxxxA", where x are digits. In the absence of  a REGEX pattern, the function will simply assign the filename as DonorID. 
+
+```{r subsample_function}
+# list files
+generate_sample_id_regex <- function(optPattern1 = "",
+                                     optPattern2 = "[0-9]+",
+                                     optPattern3 = ""){
+  pattern <- paste(optPattern1,optPattern2,optPattern3, collapse = "", sep = "")
+  return(pattern)
+                                     }
+
+subsample_events <- function(fcsDir = fcsDir, 
+                             population,
+                             exclude_vars, 
+                             subsample=1500, 
+                             min_events = 500,
+                             max_total_events = 100000,
+                             filter_list = c(),
+                             sample_id_pattern = "DEN"){
+    
+      fileLS <- list.files(path = file.path(fcsDir,population),
+      pattern = "*.csv$",
+      full.names = TRUE,
+      recursive = FALSE)
+      
+      
+      
+      if(length(filter_list) > 0){
+        fileLS <- fileLS[grepl(paste(filter_list,collapse = "|"),fileLS)]
+      }
+      set.seed(seed = 1)
+      minLines <- subsample
+      
+      
+      if((length(fileLS) * subsample) > max_total_events) {
+        events <- round((max_total_events/length(fileLS))/50)* ## round events per fil to nearest 50, to     
+        if(events < minLines){                                  ### avoid weird numbers. 
+          
+          print("Subsamping size of ", subsample,
+                " exceeds the total number fo events of ", 
+                max_total_events,
+                ". Rounding to ", events, "events per file", sep="" )
+          minLines <- events
+        }
+      }
+      
+      # Scanning step: if the csv files were derived from a pregated population that has a frequency below         # the subsample #, the subsample # needs to be reduced to that number for ALL files. Also used to   
+      # filter out samples with a too small n. of events. 
+    
+      
+      rmList <- c()
+      for (i in fileLS){
+        numLines <- length(readLines(i))
+        if(numLines < min_events){
+          print()
+          print(paste("WARNING: File ", i, " has ", numLines, 
+                      " events, which is lower than the minimum number of events", 
+                      min_events, " required. REMOVING FILE FROM ANALYSIS..", sep="" ))
+          rmList <- c(rmList,i)
+        } else if(numLines < minLines){
+          print(paste("WARNING: File ", i, " has ", numLines, " events,  
+                lower than specified current subsampling number of ", minLines,
+                ". Changing subsampling parameter...", sep=""))
+          minLines <- numLines
+        }
+      }
+      
+      if(minLines < subsample){
+        print(paste("WARNING: Subsampling ",minLines, 
+                    " events due to low number of events in files!!", sep=""))
+      } 
+      if(length(rmList) > 0){
+        fileLS_filt <- fileLS[-which(fileLS %in% rmList)]
+      } else {
+        fileLS_filt <- fileLS
+      }
+      
+      
+      
+      flowLS <- lapply(fileLS_filt, function(FILE) {
+        fName <- unique(unlist(str_extract_all(FILE,sample_id_pattern)))
+        # fName_temp <- gsub("paste(.*DEN","DEN", FILE)
+        # fName <- gsub("_[V|v]1.*","", fName_temp)
+      fileDF <- read.csv(FILE) %>%
+      as.data.frame()
+      if(minLines < subsample){
+         fileDF_randomSample <- fileDF[c(sample.int(nrow(fileDF),minLines-1)), ] %>%
+      mutate(DonorID = fName)
+      } else {
+        fileDF_randomSample <- fileDF[c(sample.int(nrow(fileDF),subsample)), ] %>%
+      mutate(DonorID = fName)
+      }
+     
+      print(paste(fName, dim(fileDF_randomSample)[1]), sep = ":")
+      return(fileDF_randomSample)
+      })
+
+      flowDF0 <- do.call(rbind, flowLS)
+      selected_channels <- colnames(flowDF0)[-which(colnames(flowDF0) %in% exclude_vars)]
+      flowDF <- flowDF0 %>%
+        dplyr::select(selected_channels) 
+      flowDF2 <- flowDF %>% dplyr::select(-DonorID)
+      output <- list("flowDF"= flowDF, "flowDF2" = flowDF2, "population" = population)
+      return(output)
+}
+
+
+
+subset_tsne_object <- function(tsne_object,DonorIDfilt = c()){
+  if(length(DonorIDfilt) == 0){
+    print("MUST SUPPLY AT LEAST ONE DONOR ID AS FILTER FOR SUBSETTING!!!")
+  }
+  
+  out_tsne_object <- tsne_object
+  
+  flowDF <- tsne_object$flowDF %>%
+    filter(DonorID %in% DonorIDfilt) 
+  out_tsne_object$flowDF <- flowDF
+  rownames_sub <- rownames(tsne_object$flowDF[tsne_object$flowDF$DonorID %in% DonorIDfilt,])
+  
+  flowDF2 <- tsne_object$flowDF2[row.names(tsne_object$flowDF2) %in% rownames_sub,]
+  out_tsne_object$flowDF2 <- flowDF2 
+  
+  if(!is.null(tsne_object$tsne$tsne_model)) {
+    tsne_Y <- as.data.frame(tsne_object$tsne$tsne_model$Y) 
+    tsne_Y <- tsne_Y[row.names(tsne_Y) %in% rownames_sub,] %>%
+      as.matrix(.)
+    out_tsne_object$tsne$tsne_model$Y <- tsne_Y
+    out_tsne_object$tsne_x1 <- as.data.frame(tsne_Y)
+    }
+  
+  if(!is.null(tsne_object$raw_tsne_cluster)) {
+    tsne_raw_clusters <- as.data.frame(tsne_object$raw_tsne_cluster) 
+    tsne_raw_clusters <- tsne_raw_clusters[row.names(tsne_raw_clusters) %in% rownames_sub,] 
+    out_tsne_object$raw_tsne_cluster <- tsne_raw_clusters
+  }
+  if(!is.null(tsne_object$cluster_freq_table)) {
+    cluster_freq_table <- as.data.frame.matrix(tsne_object$cluster_freq_table) 
+    cluster_freq_table <- cluster_freq_table[row.names(cluster_freq_table) %in% DonorIDfilt,] 
+    out_tsne_object$cluster_freq_table <- as.matrix(cluster_freq_table)
+  }
+  return(out_tsne_object)
+}
+
+#Quality of Life function to rename channels that could have typos, or that were improperly named.  
+rename_channel <- function(tsne_object, colnames_list){
+  in_object <- tsne_object
+  for(i in 1:length(colnames_list)){
+    index <- which(colnames(tsne_object$flowDF) == names(colnames_list)[[i]])
+    colnames(in_object$flowDF)[[index]] <- colnames_list[[i]] 
+    colnames(in_object$flowDF2)[[index]] <- colnames_list[[i]] 
+  }
+  out_object <- in_object
+  return(out_object)
+}
+
+```
+
+
+
+Run the subsampling function on the selected panels, with their associated parameters.
+```{r subsample_panels }
+
+
+# files pregated on relevant markers prior to tSNE. Eg : cd3-cd19-cd56-LD- to look at innate cells. 
+innate_test <- subsample_events(population = "Innate_test", 
+                           fcsDir = fcsDir,
+                           exclude_vars = c("FSC.A","FSC.H", "FSC.W", "SSC.A","SSC.W","SSC.H", 
+                                            "Time", "CD3.CD19.CD56", "VIVID"),
+                           filter_list = vac_PID$PID,
+                           subsample = 3000,
+                           sample_id_pattern = 
+                           generate_sample_id_regex(optPattern1 = "DEN",
+                                                    optPattern3 = ""),
+                           max_total_events = 20000)
+
+innate_channel_rename <- list("old_channel_name" = "new_channel_name")
+
+```
+
+
+## Run tSNE
+Run tSNE on the output from the subsamping function.
+It will simply add the computed matrices in the object.
+```{r tnse_function  }
+tsne_func <- function(subsampled_object, 
+                      perplexity = 30, 
+                      theta = 0.5, 
+                      iter = 1500, 
+                      dims = 2, 
+                      initial_dims= 50) {
+      data <- subsampled_object$flowDF2 
+      pca <- prcomp(data, center=TRUE, scale=TRUE)
+      pca_x <- pca$x %>% as.data.frame()
+      #get PC information
+      pca_importance <- as.data.frame(summary(pca)$importance) %>% t(.)
+      
+      #filter on % PC variance
+      selectedPC <- pca_importance %>% 
+      as.data.frame() %>%
+      rownames_to_column() %>% 
+      filter(`Proportion of Variance` >= 0.05) %>%
+      .$rowname %>%
+      length(.)
+
+      ##Rtsne tSNE
+      set.seed(1)
+      tsne_model_1 <- Rtsne(as.matrix(subsampled_object$flowDF2),
+      check_duplicates = F,
+      verbose = T,
+      initial_dims = selectedPC,
+      pca = T,
+      pca_scale = T,
+      pca_center = T,
+      perplexity = 30,
+      theta = theta,
+      max_iter = iter,
+      dims = dims)
+      
+      # x1 <-  as.data.frame(tsne_model_1$Y)
+
+      out_object <- subsampled_object
+      out_object$pca$pca <- pca
+      out_object$pca$pca_x <- pca_x
+      out_object$pca$pca_importance
+      # subsampled_object$tsne$tsne_model <- tsne_model_1
+      out_object$tsne$tsne_model <- tsne_model_1
+      # out_object$tsne_x1 <- x1
+      return(out_object)
+}
+```
+
+Use function on specific subsampled objects. 
+```{r tsne_on_panels}
+innate <- tsne_func(innate_test)
+
+```
+
+
+
+## Clustering of tSNE output
+Using KNN clustering on tSNE output to group events into clusters of similar expression patterns. 
+The k parameter is by default set using a square root method of the number of events; however, a custom k can be passed to the function. 
+```{r clustering}
+
+plot_tsne_raw <- function(tsne_object, geom_point = 0.01, filename ) {
+  rS <- ggplot(as.data.frame(tsne_object$tsne$tsne_model$Y), aes(x=V1, y=V2)) +  
+      geom_point(size=0.01)
+      pdf(file = filename)
+      print(rS)
+      dev.off()
+}
+
+
+clust_tsne <- function(figureDir, tsne_object, k_param = "sqrt_method"){
+   print("Preparing raw tSNE plot...")
+  
+  plot_tsne_raw(tsne_object = tsne_object, 
+                filename = file.path(figureDir,paste(tsne_object$population,"tSNE_All_events.pdf", sep="_")))
+   #Clustering
+      x0 <- cbind(as.data.frame(tsne_object$tsne$tsne_model$Y), tsne_object$flowDF)
+      #colnames(x0)
+      x2 <- x0[,c(1:2)]
+      
+    #kNN clustering
+      print("Performing KNN clustering...")
+      colnames(x2)
+      if(k_param == "sqrt_method"){
+        k <- sqrt(nrow(x2))
+      } else if (is.numeric(k_param)){
+        k <- k_param
+      } else {
+        print(paste("Error: Invalid k parameter ", k_param,", set to 60."))
+        k <- 60
+      }
+      
+    
+     knn.norm = get.knn(x0[,c(1:2)], k = k)
+      #print(knn.norm)
+      knn.norm <- data.frame(from = rep(1:nrow(knn.norm$nn.index),
+      k), to <- as.vector(knn.norm$nn.index), weight = 1/(1 +
+      as.vector(knn.norm$nn.dist)))
+      nw.norm <- graph_from_data_frame(knn.norm, directed = FALSE)
+      nw.norm <- simplify(nw.norm)
+      lc.norm <- cluster_louvain(nw.norm)
+      x2$louvain <- as.factor(membership(lc.norm))
+      colnames(x2)
+
+      lc.cent = x2 %>% group_by(louvain) %>%
+        dplyr::select(V1, V2) %>%
+        summarize_all(mean)
+      print("Preparing knn clustered tSNE plot...")
+      rS <- ggplot(x2, aes(x = V1, y = V2, colour = louvain)) +
+      geom_point(alpha = 0.05) + theme_bw() + geom_label_repel(aes(label = louvain),
+      data = lc.cent) + guides(colour = FALSE)
+      pdf(file = file.path(figureDir,paste(tsne_object$population,"tSNE_All_events_clusters.pdf", sep="_")))
+      print(rS)
+      dev.off()
+      
+      
+      #Cluster + data
+      colnames(x0)
+      x3 <- cbind(x0[,c(3:dim(x0)[2])],x2)
+      colnames(x3)
+
+      #Cluster median marker expression. Useful for deriving a heatmap of
+      median_sign_clust <- x3 %>%
+        dplyr::select(-DonorID) %>%
+        gather(marker,value,-V1,-V2,-louvain) %>%
+        mutate(value = as.numeric(value)) %>%
+        group_by(louvain, marker) %>%
+        summarise(mean = median(value, na.rm=TRUE)) %>%
+        ungroup(.) %>%
+        spread(marker, mean)
+    
+      #Frequency table per cluster
+    x6 <- as.matrix(table(x3$DonorID, x3$louvain))
+
+    out_object <- tsne_object
+    out_object$raw_tsne_cluster <- x3
+    out_object$cluster_expression <- median_sign_clust
+    out_object$cluster_freq_table <- x6
+    return(out_object)
+}
+```
+
+Compute clusters using the above functions on previously generated tsne_object containing a tSNE model. 
+This can be done IN PLACE to update the tSNE_object, or assigned to a new variable name. 
+I prwfer 
+```{r compute_clusters_on_data}
+innate_final <- clust_tsne(figureDir = figureDir, 
+                   tsne_object = innate)
+
+```
+
+This chunk of code contains useful functions when you wish to compare to groups of interest and compute statistics for each cluster. It splits the original tsne_object into 2 sub-tsne_objects. Each can then be plotted using the plot_tsne_raw function. 
+the tsne_cluster_wilcox function computes p.values using the Wilcoxon U test between groups, and then plots the significant(flexible p.value) results as boxplots. 
+The results of statistical test are saved in that same split_tsne_object
+```{r binary_comparison_func}
+tsne_obj_split <- function(tsne_object, group_list, plot = FALSE){
+  out_object <- list()
+  for(i in names(group_list)){
+    out_object[[i]] <- subset_tsne_object(tsne_object,group_list[[i]])
+    if(plot == TRUE){
+      plot_tsne_raw(out_object[[i]], 
+                    filename = file.path(figureDir, paste(tsne_object$population,
+                                                          "tSNE",
+                                                          i,
+                                                          "events.pdf",
+                                                          sep = "_")))
+    }
+  }
+  return(out_object)
+}
+
+
+
+
+tsne_cluster_wilcox <- function(split_tsne_object, plot = TRUE, cluster_pval_thr = 0.25){
+  merged_clust_table_temp <- c()
+  
+    melt_clust_vector <- lapply(names(split_tsne_object), function(FILE){
+      
+      melt_clust <- split_tsne_object[[FILE]][["cluster_freq_table"]] %>% 
+                        as.data.frame(.) %>%
+                        gather(cluster, value) %>%
+                        mutate(GroupID = FILE)
+    return(melt_clust)
+    })
+    
+  
+
+  merged_clust_table <- do.call(rbind,melt_clust_vector)
+  
+  if(length(split_tsne_object) == 2){
+    wilcox <- merged_clust_table %>%
+            group_by(cluster) %>%
+            summarize(p.value = wilcox.test(value ~ GroupID)$p.value) %>%
+            mutate(pval_check = ifelse(p.value > cluster_pval_thr, "yes", "no"))
+  } else {
+    wilcox_temp <- merged_clust_table %>%
+      group_by(cluster) %>%
+      do(wilcox.pairwise = pairwise.wilcox.test(.$value , .$GroupID, p.adjust.method = "BH" )) 
+    wilcox <- tidy(wilcox_temp, wilcox.pairwise) %>%
+      group_by(cluster) %>%
+      mutate(adj.p = p.adjust(p.value, method = "BH")) %>%
+      mutate(pval_check = ifelse(min(p.value) < cluster_pval_thr, "yes", "no")) %>%
+      mutate(adjp_check = ifelse(min(adj.p) < cluster_pval_thr, "yes", "no"))
+  }
+  
+  # wilcox <- merged_clust_table %>%
+  #         group_by(cluster) %>%
+  #         summarize(p.value = wilcox.test(value ~ GroupID)$p.value)
+  out_object <- split_tsne_object
+  out_object$wilcox.test <- wilcox
+  out_object$merged_clust_table <- merged_clust_table
+  # 
+  # if(plot == TRUE){
+  #     cluster_filter <- wilcox[wilcox$p.value_check == "yes",]$cluster
+  #   
+  #     clus_freq_df <- merged_clust_table[merged_clust_table$cluster %in% cluster_filter,]
+  #   
+  #   population <- split_tsne_object[[names(split_tsne_object)[1]]]$population
+  #   
+  #   
+  #   for(i in unique(clus_freq_df$cluster)){
+  #     temp_df <- clus_freq_df[clus_freq_df$cluster == i,]
+  #     p <- ggboxplot(temp_df, x = "GroupID", y= "value", color = "GroupID", palette = "jco",
+  #                    add = "jitter") + stat_compare_means() +
+  #         ggtitle(paste("Wilcoxon test for cluster ",i," in panel ", population, sep="")) +
+  #         xlab("Group") +
+  #         ylab("Frequency")
+  #     ggsave(p, 
+  #            device = "pdf", 
+  #            filename = file.path(wilcox_dir,
+  #                                 paste(population,"_cluster_",i,".pdf", sep="" )))
+  #   }
+  # }
+  
+  return(out_object)
+}
+
+plot_wilcox <- function(split_tsne_object, selected_comparisons = c()) {
+  wilcox <- split_tsne_object$wilcox.test 
+  cluster_filter <- wilcox[wilcox$p.value_check == "yes",]$cluster
+
+      clus_freq_df <- merged_clust_table[merged_clust_table$cluster %in% cluster_filter,]
+
+    population <- split_tsne_object[[names(split_tsne_object)[1]]]$population
+
+
+    for(i in unique(clus_freq_df$cluster)){
+      temp_df <- clus_freq_df[clus_freq_df$cluster == i,]
+      p <- ggboxplot(temp_df, x = "GroupID", y= "value", color = "GroupID", palette = "jco",
+                     add = "jitter") + stat_compare_means() +
+          ggtitle(paste("Wilcoxon test for cluster ",i," in panel ", population, sep="")) +
+          xlab("Group") +
+          ylab("Frequency")
+      ggsave(p,
+             device = "pdf",
+             filename = file.path(wilcox_dir,
+                                  paste(population,"_cluster_",i,".pdf", sep="" )))
+    }
+  
+}
+
+```
+
+```{r immune_naive_comparison}
+
+PID_selection <- outcome_df %>%
+  filter(Vaccine_status == "Vaccine") 
+
+#generate a list of sampleID for each group as a guide to split the tsne_object. 
+#eg: list("Healthy" = c("P001","P0020","P003","P004","P005"), 
+#         "Sick" = c("P006","P007","P008","P009","P010"))
+group_list <- list("Naive" = PID_selection[PID_selection$Immune_status_at_baseline == "Naive",]$PID,
+                   "Immune" = PID_selection[PID_selection$Immune_status_at_baseline == "Immune",]$PID)
+
+group_list_test <- list("naive" = PID_selection$PID[c(1:10)], 
+                        "immune" = PID_selection$PID[c(11:20)], 
+                        "fails" = PID_selection$PID[c(21:30)],
+                        "success" = PID_selection$PID[c(31:40)])
+ 
+
+innate_split <- tsne_obj_split(innate_final,group_list = group_list, plot = TRUE)
+innate_split <- tsne_cluster_wilcox(innate_split, cluster_pval_thr = 0.10)
+
+innate_split_test <- tsne_obj_split(innate_final,group_list = group_list_test, plot = FALSE)
+
+
+test <- tsne_cluster_wilcox(innate_split_test, cluster_pval_thr = 0.25)
+
+
+
+
+```
+
+
+
+
+## Regression of Dengue outcomes against tSNE cluster frequencies
+The next portion becomes useful if you have a continuous variable against which you wish to model the frequency of cells in each cluster, in each sample. 
+```{r tSNE_regression_function, warning=FALSE}
+
+regress_tSNE <- function(tsne_object, immune_status, outcome_df,univariate_dir ) {
+  long_corr <- tsne_object$cluster_freq_table %>% as.data.frame(.) %>%
+              rownames_to_column("PID") %>%
+              gather(cluster, Freq, -PID) %>%
+              #rename(PID="Var1") %>%
+              #rename(cluster="Var2") %>%
+              inner_join(.,outcome_df, by=c("PID"="PID")) %>%
+              filter(Vaccine_status == "Vaccine") %>%
+              filter(Immune_status_at_baseline == immune_status) %>%
+              gather(outcome, outcome_val, which(colnames(.) %in% outcome_list)) %>%
+              filter(!grepl("D0_",outcome)) %>%
+              filter(!grepl("lowhi",outcome))   
+  
+  regression <- long_corr %>%
+              filter(Immune_status_at_baseline == immune_status) %>%
+              filter(!is.na(outcome_val)) %>%
+              mutate(outcome_val = as.numeric(outcome_val))  %>%
+              mutate(combo=paste(outcome,cluster,sep="__") )
+
+#Create a new dataframe with the results of the Spearman corr
+  regression_models <- regression %>%
+      group_by(cluster,outcome) %>%
+      mutate(num_datapoints = n()) %>%
+      filter(num_datapoints >= 4) %>%
+      do(model = cor.test(.$Freq, .$outcome_val ,method="spearman")) 
+  
+  tidy_model <- tidy(regression_models,model)
+  tidy_model <- tidy_model %>%
+    mutate(combo = paste(outcome,cluster,sep="__")) %>%
+    ungroup(.) %>%
+    group_by(outcome) %>%
+    mutate(padj = p.adjust(p.value,method="BH")) %>%
+    ungroup(.) %>% 
+    as.data.frame(.)
+  print(tidy_model)
+  clusLS_filt <- as.numeric(as.character(unique(tidy_model[tidy_model$p.value <= 0.05,]$cluster)))
+  print(clusLS_filt)
+  tidy_model_relax <- tidy_model %>%
+    filter(cluster %in% clusLS_filt) %>%
+    filter(p.value <= 0.25)
+  
+  tidy_model <- tidy_model %>%
+    filter(p.value <= 0.05)
+  
+  regr_filt <- regression[regression$combo %in% tidy_model$combo,] 
+
+  for(i in unique(regr_filt$combo)){
+    df <- regr_filt
+    df <- df[df$combo == i,]
+    rho <- tidy_model[tidy_model$combo == i,]$estimate
+    pval <- tidy_model[tidy_model$combo == i,]$p.value
+    adjp <- tidy_model[tidy_model$combo == i,]$padj
+    label <- paste("rho=",round(rho,3),"\np=",round(pval,3),"\nadjp=",round(adjp,3),sep="")
+    p <- ggplot(df,aes(x=Freq, y=outcome_val)) + theme_bw()  +
+             geom_point(size=2)  +
+             geom_smooth(method="rlm") +
+             labs(x="Frequency of cells in tSNE cluster", y= "Outcome" ) +
+             theme(axis.title = element_text(family = "Times", face="bold", size=16)) +
+             theme(axis.text = element_text(family = "Times", face="bold", size=10)) +
+            ggtitle(paste(df$outcome,df$analyte, "naive",sep="_")) +
+            annotate("text",x=min(df$Freq),y=max(df$outcome_val)-0.5,hjust=.2,label=label)
+    pdf(file=file.path(univariate_dir,paste(immune_status,"_",tsne_object$population,"_",unique(df$cluster),
+                                            "_",unique(df$outcome), ".pdf", sep="")))
+     print(p)
+     dev.off() 
+     print(p)
+  }
+  regression_output <- list()
+  regression_output$tidy_model <- tidy_model
+  regression_output$tidy_model_relax <- tidy_model_relax
+  regression_output$regression <- regression
+  regression_output$regression_models <- regression_models
+  return(regression_output)
+}
+```
+
+```{r regress_dv , echo=FALSE, warning=FALSE, results="hide"}
+innate_final_naive <- subset_tsne_object(innate_final, DonorIDfilt = group_list[["Naive"]])
+
+innate_regression_naive <- regress_tSNE(tsne_object = innate_final_naive,
+                                  immune_status =  "Naive",
+                                  outcome_df = outcome_df,
+                                  univariate_dir = univariate_dir)
+
+
+
+```
+
+Produce a heatmap of regression coefficients. 
+```{r coeff_hm}
+select_early_outcomes <- c("DV1_AUCp_log","DV2_AUCp_log","DV3_AUCp_log","DV4_AUCp_log",
+                           "DV1_AUCb_log","DV2_AUCb_log","DV3_AUCb_log","DV4_AUCb_log",
+                           "D28_Breadth","D56_Breadth","D91_Breadth", "D271_Breadth", "D236_Breadth",
+                           "D208_Breadth" )
+
+
+
+coefficient_heatmap <- function(tidy_model, selected_outcomes, filename, title){
+  coeffs <- tidy_model %>%
+              dplyr::select(outcome, cluster, estimate) %>%
+              filter(outcome %in% select_early_outcomes) %>%
+              spread(cluster,estimate) %>%
+              gather(cluster, estimate, -outcome) %>%
+              mutate(estimate = ifelse(is.na(estimate), 0, estimate)) %>%
+              mutate(cluster = as.numeric(cluster)) %>%
+              arrange(cluster) %>%
+              spread(cluster,estimate) %>%
+              as.data.frame(.) %>%
+              column_to_rownames("outcome") %>%
+              as.matrix(.)
+  paletteLength <- 500
+  colorLS <- colorRampPalette(colors = c("blue", "cyan",
+                                         "white",
+                                         "yellow", "red"))(paletteLength)
+  topScale <- max(abs(min(coeffs)),abs(max(coeffs)))
+  myBreaks <- seq(-topScale, topScale, length.out=paletteLength)
+  p <- pheatmap(t(coeffs),
+              fontsize= 8, 
+              cluster_rows = FALSE, 
+              cluster_cols= FALSE,
+              color=colorLS,
+              scale = "none",
+              main = title,
+              cellheight = 12,
+              cellwidth = 12,
+              show_colnames = TRUE, 
+              breaks=myBreaks,
+              filename=filename)
+  print(p)
+  return(p)
+}
+```
+
+
+This next portion allows yout o make a heatmap of the relative expression of each marker per cluster. 
+This allows to quickly visualize what a cluster represents in a biologically intuitive manner, 
+
+Added a function (extract_cluster_filter) to allow filtering that heatmap on the output of the regression.
+
+A relative expression is calculated differently depending on the approach: if some speciffic events for exported out of flwjo, (e.g live CD3+CD4+ cells), you'll need a subsample objects (first step) of all events (or live cells) in parralel. Otherwise, CD4 and CD3 in the heatmap will show as average... since it can only be computed among other CD3+ CD4+ cells. 
+The specific calculation is done by taking the median expressionn of marker in each luster and dividing it by the median expression of that marker in all events, ot botain the log(fold change) expression in that cluster. 
+```{r tsne_expression_hm_func}
+
+extract_cluster_filter <- function(tidy_model, outcome_list){
+  df <- tidy_model
+  df_filt <- df[df$outcome %in% outcome_list,]
+  print(df_filt)
+  clusLS <- unique(df_filt$cluster)
+  clusLS <- as.numeric(as.character(clusLS))
+  extr_clus <- list("clusLS" = clusLS, "tidy_filt" = df_filt)
+  return(extr_clus)
+}
+
+# This requires a flowDF (tsne_all aparameter) from all events if the samples were exported after some gating to enrich some cells of interest. leave blank to calculate background on the same sample. 
+tsne_relative_expression <- function(figureDir, tsne_object, cluster_filter, tsne_all = "", 
+                                     transform = "arcsinh", cofactor = 150){
+  if(tsne_all == ""){
+    tsne_all <- tsne_object$flowDF
+  }
+  # df_all <- tsne_all %>%
+  #   as.data.frame(.) %>%
+  #   gather(marker,value,-DonorID) %>%
+  #   group_by(marker) %>%
+  #   summarise(med_all = median(value)) %>%
+  #   ungroup(.) 
+  
+  df_all <- tsne_all %>%
+    as.data.frame(.) %>%
+    gather(marker,value,-DonorID) %>%
+    group_by(marker) %>%
+    arrange(value) %>%
+    summarise(med_all = median(head(value,100))) %>%
+    ungroup(.) 
+  
+  print(df_all[[1]])
+  expr_matr <- tsne_object$cluster_expression %>% 
+    gather(marker,value,-louvain)
+  
+  if(cluster_filter != "") {
+    expr_matr <- expr_matr %>% filter(louvain %in% cluster_filter)
+    prefix <- "all"
+  } else {
+    prefix <- "sig"
+  }
+  
+  expr_matr <- expr_matr %>%
+    group_by(marker,louvain) %>%
+    mutate(med_expr = median(value)) %>%
+    ungroup(.) %>%
+    inner_join(.,df_all,by=c("marker"="marker")) %>%
+    group_by(marker,louvain) %>%
+    mutate(med_expr = ifelse(med_expr < 0, 0.1, med_expr)) %>%
+    mutate(med_all = ifelse(med_all < 0, 0.1, med_all)) 
+  
+  if(transform == "log10") {
+    expr_matr <- expr_matr %>%
+      mutate(relative_expression = log((med_expr / med_all), 10 ))
+  } else if(transform == "log2") {
+    expr_matr <- expr_matr %>%
+      mutate(relative_expression = log((med_expr / med_all), 2 ))
+  } else if(transform == "arcsinh") {
+    expr_matr <- expr_matr %>%
+      mutate(relative_expression = arcsinh(med_expr/cofactor) - arcsinh(med_all/cofactor)) 
+  }
+    expr_matr <- expr_matr %>%
+    ungroup(.) %>%
+    dplyr::select(-value,-med_expr, -med_all) %>%
+    mutate(relative_expression = as.numeric(relative_expression)) %>%
+    spread(marker,relative_expression) %>%
+    as.data.frame(.) %>%
+    column_to_rownames("louvain") %>%
+    as.matrix(.)
+ 
+  paletteLength <- 500
+  colorLS <- colorRampPalette(colors = c("blue", "cyan",
+                                         "white",
+                                         "yellow", "red"))(paletteLength)
+
+  myBreaks <- c(seq(min(expr_matr), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(expr_matr)/paletteLength, max(expr_matr), length.out=floor(paletteLength/2)))
+
+  p <- pheatmap(expr_matr,
+              fontsize= 8,
+              cluster_rows = TRUE,
+              cluster_cols= FALSE,
+              scale = "none",
+              #main = title,
+              cellheight = 12,
+              show_colnames = TRUE,
+              color = colorLS,
+              breaks = myBreaks,
+              filename=file.path(figureDir,
+                                 paste(prefix,tsne_object$population,
+                             "cluster_median_marker_relative_expression.pdf",
+                             sep="_")))
+  print(p)
+
+  return(p)
+}
+
+## function that uses absolute expression values for each cluster median, and comparares it accross clusters. That theortically shows whats higher in one cluster vs another. This is not recommended if the events had a pregating step: it will not be representative of true expression. E.g. gating on CD3+ cells, then showing cd3 expression per cluster post tSNE, shows an average expression of CD3. 
+tsne_scaled_expression <- function(figureDir, tsne_object, cluster_filter){
+  expr_matr <- tsne_object$cluster_expression %>%
+    filter(louvain %in% cluster_filter) %>%
+    as.data.frame(.) %>%
+    column_to_rownames("louvain") %>%
+    as.matrix(.)
+  
+
+  p <- pheatmap(expr_matr,
+              fontsize= 8, 
+              cluster_rows = TRUE, 
+              cluster_cols= FALSE,
+              scale = "column",
+              #main = title,
+              cellheight = 12,
+              cellwidth = 12,
+              show_colnames = TRUE, 
+              filename=file.path(figureDir,
+                                 paste(tsne_object$population,
+                             "cluster_medianrage_marker_scaled_expression.pdf", 
+                             sep="_")))
+  print(p)
+  return(expr_matr)
+}
+```
+
+Generate a heatmap 
+```{r cluster_expression_matr}
+innate_expr_naive <- tsne_relative_expression(figureDir = figureDir, 
+                tsne_object = innate_final_naive,
+                cluster_filter = extract_cluster_filter(innate_regression_naive$tidy_model,
+                                                        select_early_outcomes)$clusLS,
+                tsne_all = innate_all$flowDF)
+
+
+```
+
+alternative function for drawing a regression heatmap. Instead of squares, it has dots, where the size of the dot maps to the pvalue of the model. Suggested to relax the pvalue, so that you can see both significant and close-to-significant models. 
+```{r test_dot_hm}
+
+extract_dendr_order <- function(hclust_object){
+  order_list <- c()
+  for(i in 1:length(hclust_object$order)){
+    order_list <- c(order_list,hclust_object$labels[hclust_object$order[i]])
+  }
+  order_df <- order_list %>%
+    as.data.frame(.) %>%
+    rownames_to_column("order") %>%
+    rename("leaf" = "." ) %>%
+    mutate(order = as.numeric(order)) %>%
+    mutate(leaf = as.character(leaf)) %>%
+    as.data.frame(.)
+  #order_df$leaf <- reorder(order_df$leaf, order_df$order)
+  return(order_df)
+}
+
+
+coefficient_heatmap_dots <- function(tidy_model, 
+                                     selected_outcomes, 
+                                     filename, 
+                                     title, 
+                                     row_order_df, 
+                                     axis_text_size) {
+  pval <- tidy_model %>%
+    dplyr::select(outcome,cluster,p.value) %>%
+      mutate(combo = paste(outcome,cluster,sep=")")) %>%
+      dplyr::select(-outcome,-cluster) 
+  
+  coeffs <- tidy_model %>%
+              dplyr::select(outcome, cluster, estimate) %>%
+              filter(outcome %in% select_early_outcomes) %>%
+              spread(cluster,estimate) %>%
+              gather(cluster, estimate, -outcome) %>%
+              mutate(estimate = ifelse(is.na(estimate), 0, estimate)) %>%
+              mutate(combo = paste(outcome,cluster,sep=")")) %>%
+              inner_join(.,pval, by=c("combo"="combo")) %>%
+              inner_join(.,row_order_df, by=c("cluster" = "leaf")) %>%
+              mutate(order = as.numeric(as.character(order))) %>%
+              arrange(order) %>%
+              mutate(p.value = ifelse(is.na(p.value), 1, p.value)) %>%
+              mutate(cluster = factor(cluster)) %>%
+              mutate(cluster = fct_reorder(cluster,-order)) %>%
+              filter(p.value <= 0.25) %>%
+              mutate(outcome = factor(outcome, levels = selected_outcomes)) %>%
+              as.data.frame(.) 
+
+  
+  mytheme <- theme_bw() + 
+              theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+                    legend.position="left",
+                    axis.text=element_text(size=axis_text_size),
+                    axis.title=element_text(size=16,face="bold"))
+  p  <- ggplot(coeffs, aes(outcome,cluster, size=p.value)) + 
+    geom_point(aes(fill = estimate), shape=21) + 
+    scale_fill_gradient2(low="blue", mid="white", high="red") + 
+    scale_size_continuous(range = c(12,3))  + 
+    mytheme
+    
+  ggsave(p, filename = filename, height = 5, width = 5, device = "pdf", units= "in", dpi = 300, scale = 1.5)
+     
+  print(p)
+}
+
+
+
+
+```
+
+
+
+```{r generate_coeff_hm}
+innate_naive_hm <- coefficient_heatmap_dots(innate_regression_naive$tidy_model_relax,
+                    selected_outcomes = select_early_outcomes,
+                    filename = file.path(univariate_dir,"innate_naive_regression_coeffs_heatmap.pdf"),
+                    title = "Innate panel tSNE cluster frequencies vs Dengue outcomes for naive patients univariate    regression coefficients",
+                    row_order_df = extract_dendr_order(innate_expr_naive$tree_row))
+
+CD4_naive_hm <- coefficient_heatmap_dots(CD4_regression_naive$tidy_model_relax,
+                    selected_outcomes = select_early_outcomes,
+                    filename = file.path(univariate_dir,"CD4_naive_regression_coeffs_heatmap.pdf"),
+                    title = "CD4 T cell panel tSNE cluster frequencies vs Dengue outcomes for naive patients univariate    regression coefficients",
+                    row_order_df = extract_dendr_order(CD4_expr_naive$tree_row))
+
+CD19_naive_hm <- coefficient_heatmap_dots(CD19_regression_naive$tidy_model_relax,
+                    selected_outcomes = select_early_outcomes,
+                    filename = file.path(univariate_dir,"CD19_naive_regression_coeffs_heatmap.pdf"),
+                    title = "CD19 B cell panel tSNE cluster frequencies vs Dengue outcomes for naive patients univariate    regression coefficients",
+                    row_order_df = extract_dendr_order(CD19_expr_naive$tree_row))
+
+
+```
+
+
+
+```{r dot_hm}
+innate_naive_hm <- coefficient_heatmap(innate_regression_naive$tidy_model_relax,
+                    selected_outcomes = select_early_outcomes,
+                    filename = file.path(univariate_dir,"innate_naive_regression_coeffs_heatmap.pdf"),
+                    title = "Innate panel tSNE cluster frequencies vs Dengue outcomes for naive patients univariate    regression coefficients" )
+
+
+```
+
+
+

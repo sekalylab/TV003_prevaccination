@@ -1,0 +1,3049 @@
+---
+title: "metabolon_DV_baseline"
+author: "Adam Pelletier"
+date: "3/29/2019"
+output: html_document
+---
+
+```{r setup, message = FALSE, warning=FALSE}
+#### Load required packages for analysis
+## Some packages may require installation from Bioconductor : "https://bioconductor.org/install/" 
+suppressPackageStartupMessages(library(rstudioapi))
+suppressPackageStartupMessages(library(rmarkdown))
+suppressPackageStartupMessages(library(plyr))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(purrr))
+suppressPackageStartupMessages(library(tidyr))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(stringr))
+suppressPackageStartupMessages(library(tibble))
+suppressPackageStartupMessages(library(GSVA))
+suppressPackageStartupMessages(library(GSEABase))
+suppressPackageStartupMessages(library(cluster))
+suppressPackageStartupMessages(library(magrittr))
+suppressPackageStartupMessages(library(gdata))
+suppressPackageStartupMessages(library(reshape2))
+suppressPackageStartupMessages(library(broom))
+suppressPackageStartupMessages(library(fgsea))
+suppressPackageStartupMessages(library(pheatmap))
+suppressPackageStartupMessages(library(janitor))
+suppressPackageStartupMessages(library(caret))
+suppressPackageStartupMessages(library(igraph))
+suppressPackageStartupMessages(library(readr))
+suppressPackageStartupMessages(library(scales))
+suppressPackageStartupMessages(library(circlize))
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(getwd())
+```
+
+## RNA-Seq Downstream analysis
+
+### Setup directories 
+
+``` {r dirSetup}
+setup_dir <- function(dir_string) { 
+  ### Verifies creates a directory if it doesn't exist. Returns the dir_path
+  if (dir.exists(dir_string)){
+    dir_set <- dir_string
+  } else {
+    dir.create(dir_string) 
+    dir_set <- dir_string
+  }
+  return(dir_set)
+}
+
+inputDir <- setup_dir("input")
+
+
+outputDir <- setup_dir("output")
+figureDir <- setup_dir(file.path(outputDir,"figures"))
+dataOutDir <- setup_dir(file.path(outputDir,"data"))
+genesetsDir <- setup_dir(file.path(inputDir,"genesets"))
+lassoDir <- setup_dir(file.path(figureDir,"multivariate_regression"))
+
+```
+
+```{r inputfiles}
+
+outcome_df <- read.table("../Baseline_analysis_Metabolon/../../outcomes/DV_outcomes_05082019_ANP.txt", 
+                         sep = "\t", header = TRUE) %>%
+              filter(DV1_AUCp_log != "NA")
+              # as.data.frame(.) %>%
+              # mutate(D180_Breadth_imputed = ifelse(is.na(D180_Breadth), 
+              #                                      ifelse(D91_Breadth < 4, D91_Breadth, NA),
+              #                                      D180_Breadth)) %>%
+              # mutate(D180_Breadth_bin = ifelse(D180_Breadth_imputed == 4, "high", "low" )) %>%
+              # #mutate(D180_Breadth_bin = factor(D180_Breadth_bin, levels = c("low", "high")))
+              # mutate(D180_Breadth_bin = factor(D180_Breadth_bin, levels = c("high","low"))) %>%
+              # mutate(D91_Breadth_bin = ifelse(D91_Breadth == 4, "high", "low")) %>%
+              # mutate(D91_Breadth_bin = factor(D91_Breadth_bin, levels = c("high", "low"))) %>%
+              # rowwise() %>%
+              # mutate(top_breadth = max(D28_Breadth, D56_Breadth, D91_Breadth, na.rm = TRUE))
+
+AUCp <- colnames(outcome_df)[grepl("DV[1-4]_AUCp_log", colnames(outcome_df))]
+#breadth <- colnames(outcome_df)[grepl("top_breadth$|D91_Breadth$|D180_Breadth$", colnames(outcome_df))]
+breadth_bin <- c("Cumulative_Breadth_dichot", "D91_Breadth_dichot")
+
+outcome_df_filt <- outcome_df %>%
+                  dplyr::select(PID, Group, Immune_status_at_baseline, Vaccine_status, AUCp,
+                                 breadth_bin)
+
+print(as.tibble(outcome_df_filt))
+# extract pdata
+
+
+outcome_df <- read.table(file = "../../outcomes/DV_outcomes_05082019_ANP.txt", sep = "\t", header = T) 
+ outcome_df2 <- read.table(file = "../../outcomes/DV_outcomes_04292019_ANP.txt", sep = "\t", header = T) %>%
+                  dplyr::select(c(1,6,8,10,12))
+                
+      
+unsup_outcomes_legend <- read.csv(file = "../../Caprion_proteomics_metab/Caprion_proteomics/input/ZWF_Exp2_clusters_20191219.csv") %>%
+                  dplyr::select(c(7,8)) %>%
+                  filter(!is.na(Cluster.Correspondence))
+          
+
+unsup_outcomes <- read.csv(file = "../../Caprion_proteomics_metab/Caprion_proteomics/input/ZWF_Exp2_clusters_20191219.csv") %>%
+                   dplyr::select(c(1,2,3)) %>%
+                  inner_join(., unsup_outcomes_legend, by = c("cluster" = "Cluster.Correspondence")) %>%
+                  mutate(PID = as.character(pat_ID_num)) %>%
+                  mutate(PID = paste("DEN", PID, "A", sep = "")) %>%
+                  dplyr::rename(caprion_clusters = "Group.in.EDR",
+                                DCT_labels = "cluster") %>%
+                  dplyr::select(PID, DCT_labels, caprion_clusters)
+
+
+
+
+outcome_merged <- inner_join(outcome_df, unsup_outcomes, by = "PID") %>%
+                  inner_join(., outcome_df2, by = "PID") %>%
+                  mutate(caprion_clusters_ord = factor(caprion_clusters, 
+                                                   levels = c("Non-Responsive", "Oligovalent", "Intermediary", "Polyvalent")))
+                  
+pData <- read_excel(path = "input/CASE-05-18ML/CASE-05-18ML CDT.XLSX", sheet = "pData") %>%
+       gather(sample_ids, value, -SAMPLE_NAME) %>%
+       spread(SAMPLE_NAME, value ) %>%
+       rename(PID = "SUBJECT_ID") %>%
+       left_join(.,outcome_merged, by = "PID") %>%
+       filter(Immune_status_at_baseline == "Naive") %>%
+       filter(Group == "A") %>% 
+       filter(Vaccine_status == "Vaccine") 
+
+print(pData)
+sample_ids_sel <- pData$sample_ids
+
+print(pData)
+```
+
+
+```{r }
+# read input data
+canonical_HMDB <- read_excel("~/Documents/SMPDB/hmdb_secondary_accesions.xlsx")
+
+inputDF <- read_excel(path = "input/CASE-05-18ML/CASE-05-18ML CDT.XLSX", sheet = "scaled_data_clean") %>%
+        dplyr::select(-PATHWAY_SORTORDER, -COMP_ID, -PLATFORM, -RI, -MASS, -CAS, -PUBCHEM,
+                      -CHEMSPIDER, -KEGG) %>%
+  
+          dplyr::select(BIOCHEMICAL, SUPER_PATHWAY, SUB_PATHWAY, CHEMICAL_ID, HMDB_ID, sample_ids_sel) %>%
+          gather(sample_ids, value, sample_ids_sel) %>%
+          left_join(pData, by = "sample_ids" ) %>%
+          
+          left_join(., canonical_HMDB, by = c("HMDB_ID" = "secondary_accession")) %>%
+          dplyr::select(-HMDB_ID) %>%
+          dplyr::rename(HMDB_ID = "canonical_accession") %>%
+          mutate(CHEMICAL_ID = as.character(CHEMICAL_ID))
+
+
+
+fData <- inputDF %>%
+        dplyr::select(BIOCHEMICAL, SUPER_PATHWAY,SUB_PATHWAY,CHEMICAL_ID,HMDB_ID) %>%
+        distinct(.)
+
+
+
+# contrasts <- list("Pf" = c("Pf_Acute", "Pf_Recovery"),
+#                   "Pv" = c("Pv_Acute", "Pv_Recovery"),
+#                   "AFNM" = c("AFNM_Acute", "AFNM_Recovery"),
+#                   "Acute_Pf_AFNM" = c("Pf_Acute", "AFNM_Acute"),
+#                   "Acute_Pv_AFNM" = c("Pv_Acute", "AFNM_Acute"),
+#                   "Acute_Pf_Pv" = c("Pf_Acute", "Pv_Acute"),
+#                   "Recovery_Pf_AFNM" = c("Pf_Recovery", "AFNM_Recovery"),
+#                   "Recovery_Pv_AFNM" = c("Pv_Recovery", "AFNM_Recovery"),
+#                   "Recovery_Pf_Pv" = c("Pf_Recovery", "Pv_Recovery"))
+
+metabolon_DEM_temp <- inputDF %>%
+                gather(outcome, outcome_val, AUCp) %>%
+                group_by(outcome, CHEMICAL_ID) %>%
+                mutate(distinct_n = n_distinct(value, na.rm = TRUE)) %>%
+                filter(distinct_n > 1) %>%
+                do(model = cor.test(.$value, .$outcome_val , method="spearman")) %>%
+                tidy(., model) %>%
+                ungroup(.) %>%
+                group_by(outcome) %>%
+                mutate(adjp = p.adjust(p.value, method = "BH")) %>%
+                arrange(p.value) %>%
+                left_join(., fData, by = "CHEMICAL_ID") %>%
+                dplyr::select(-method, -alternative, -statistic) %>%
+                dplyr::select(BIOCHEMICAL, everything()) %>%
+                dplyr::rename(effect_size = "estimate") 
+
+metabolon_DEM <- split(metabolon_DEM_temp, f= metabolon_DEM_temp$outcome)
+                       
+metabolon_bin <-   inputDF %>%
+                mutate(caprion_clusters_ord = ifelse(caprion_clusters_ord == "Polyvalent", caprion_clusters_ord,
+                                                     "Oligovalent")) %>%
+                gather(outcome, outcome_val, c(breadth_bin, "caprion_clusters_ord")) %>%
+                group_by(outcome, CHEMICAL_ID) %>%
+                mutate(distinct_n = n_distinct(value, na.rm = TRUE)) %>%
+                filter(distinct_n > 1) %>%
+                do(model = t.test(value~outcome_val, var.equal = FALSE, data = .)) %>%
+                tidy(., model) %>%
+                ungroup(.) %>%
+                group_by(outcome) %>%
+                mutate(adjp = p.adjust(p.value, method = "BH")) %>%
+                arrange(p.value) %>%
+                left_join(., fData, by = "CHEMICAL_ID") %>%
+                dplyr::select(-method, -alternative, -statistic) %>%
+                dplyr::select(BIOCHEMICAL, everything()) %>%
+                dplyr::rename(effect_size = "estimate") 
+
+
+
+unsup_clust_stats_pw <- do.call("rbind", lapply(combn(c("Polyvalent", "Intermediary", "Oligovalent"), m = 2, simplify = F),
+                                             function(x){
+  levels <- x
+  
+  prep <- inputDF %>%
+                gather(outcome, outcome_value, caprion_clusters_ord)  %>%
+                #filter(grepl("caprion", outcome)) %>%
+                filter(outcome_value %in% levels) %>%
+                mutate(outcome_value = factor(outcome_value, levels= c(x[1], x[2]))) %>%
+                filter(!is.na(value)) 
+  
+  
+  n <-  prep %>%
+        group_by(BIOCHEMICAL, outcome_value) %>%
+        mutate(n = n()) %>%
+        ungroup(.) %>%
+        group_by(BIOCHEMICAL) %>%
+        mutate(var = var(value)) %>%
+        ungroup() %>%
+        dplyr::select(BIOCHEMICAL, n, var) %>%
+        unique() %>%
+        filter(var != 0) %>%
+        group_by(BIOCHEMICAL) %>%
+        mutate(sufficientn = sum(n > 3)) %>%
+        filter(sufficientn == 2) #%>%
+  
+          
+  stats  <- prep %>%
+                #filter(grepl("caprion", outcome)) %>%
+                filter(BIOCHEMICAL %in% n$BIOCHEMICAL) %>%
+                # filter(outcome_value %in% levels) %>%
+                # mutate(outcome_value = factor(outcome_value, levels= c(x[1], x[2]))) %>%
+                # filter(!is.na(value)) %>%
+                group_by(BIOCHEMICAL) %>%
+                mutate(abs = abs(value)) %>%
+                mutate(value = value + max(abs) + 1) %>%
+                do(model = t.test(.$value ~ .$outcome_value)) %>%
+                tidy(., model) %>%
+                ungroup(.) %>%
+                mutate(group1 = x[1],
+                       group2 = x[2],
+                       comparison = paste(x[1], "_vs_", x[2], sep ="")) %>%
+                dplyr::rename(t = "statistic") %>%
+                inner_join(., fData, by = "BIOCHEMICAL" ) %>%
+                arrange(desc(t)) %>%
+                dplyr::rename(effect_size = "estimate") %>%
+                mutate(adjp = 1)
+                  
+  return(stats)
+})) %>%
+  split(., f = .$comparison)
+
+# metabolon_unsup_pw <-   inputDF %>%
+#                 gather(outcome, outcome_val, c(breadth_bin, "caprion_clusters_ord")) %>%
+#                 group_by(outcome, CHEMICAL_ID) %>%
+#                 mutate(distinct_n = n_distinct(value, na.rm = TRUE)) %>%
+#                 filter(distinct_n > 1) %>%
+#                 do(model = t.test(value~outcome_val, var.equal = FALSE, data = .)) %>%
+#                 tidy(., model) %>%
+#                 ungroup(.) %>%
+#                 group_by(outcome) %>%
+#                 mutate(adjp = p.adjust(p.value, method = "BH")) %>%
+#                 arrange(p.value) %>%
+#                 left_join(., fData, by = "CHEMICAL_ID") %>%
+#                 dplyr::select(-method, -alternative, -statistic) %>%
+#                 dplyr::select(BIOCHEMICAL, everything()) %>%
+#                 dplyr::rename(effect_size = "estimate") 
+
+
+
+test <- read_excel("../../Caprion_proteomics_metab/Caprion_metabolomics/input/ZUQ_EA_EDR_01MAY2019.xlsx")
+
+
+
+```
+
+
+```{r metabolon DEM_heatmaps}
+
+# metab_matrix <- inputDF %>%
+#         dplyr::select(CHEMICAL_ID, BIOCHEMICAL, sample_ids,  value) %>%
+#         dplyr::filter(!is.na(CHEMICAL_ID)) %>%
+#         distinct(.) %>%
+#         # rowid_to_column() %>%
+#         # dplyr::select(-rowid) %>%
+#         spread(sample_ids, value)    %>%
+#         dplyr::select(-BIOCHEMICAL) %>%
+#         column_to_rownames("CHEMICAL_ID") %>%
+#         as.matrix(.)
+
+
+# test <- expression_hm_metabolon(inputDF = inputDF ,
+#                         fData = fData,
+#                         pData = pData, 
+#                         tidy_stats = combined_metabolon_DEM$Malaria,
+#                         samples_filt = pData[pData$DISEASE == "Pf" | pData$DISEASE == "Pv",]$sample_ids,
+#                         )
+
+
+fdata_annot <- fData %>% filter(!is.na(CHEMICAL_ID)) %>% 
+              mutate(SUB_PATHWAY_FILT = ifelse(SUPER_PATHWAY == "Lipid", SUB_PATHWAY, NA)) %>%
+              column_to_rownames("CHEMICAL_ID")
+pData_annot <- pData %>% column_to_rownames("sample_ids")
+
+
+
+for(i in c(AUCp)){
+  hm.params <- list(annotation_row = fdata_annot["SUPER_PATHWAY"],
+                     annotation_col = pData_annot[i],
+                     cellheight = 8,
+                    cluster_cols = FALSE)
+    try(DEM_hm <- expression_hm_metabolon(inputDF = inputDF ,
+                            fData = fData,
+                            pData = pData, 
+                            tidy_stats = metabolon_DEM[[i]],
+                            #samples_filt = pData$sample_ids,
+                            hm.params = hm.params,
+                            filename = file.path(figureDir,paste("DEM_", i, "_heatmap.pdf", sep = "")),
+                            height = 32,
+                            padj_thr = 0.99,
+                            p_thr = 0.01, 
+                            contrast = i))
+}
+  
+
+metabolon_bin_split <- split(metabolon_bin, f= metabolon_bin$outcome)
+metabolon_bin_split <- metabolon_bin_split[grepl("dichot",names(metabolon_bin_split))]
+
+ DEM_hm_bin <- list()
+for(i in names(metabolon_bin_split)){
+  hm.params_bin <- list(annotation_row = fdata_annot["SUB_PATHWAY_FILT"],
+                     annotation_col = pData_annot[i],
+                     cellheight = 8,
+                     cluster_cols = F,
+                     annotation_colors = list("Cumulative_Breadth_dichot" = 
+                                                c("high" = "#F1978C" , "low" = "#63D7DE")) )
+  print(i)
+  DEM_hm_bin[[i]] <- expression_hm_metabolon(inputDF = inputDF ,
+                              fData = fData,
+                              pData = pData, 
+                              tidy_stats = metabolon_bin_split[[i]],
+                              #samples_filt = pData$sample_ids,
+                              hm.params = hm.params_bin,
+                              filename = file.path(figureDir,
+                                                   paste("DEM_", i, "_heatmap.pdf", sep = "")),
+                              height = 32,
+                              padj_thr = 1,
+                              p_thr = 0.05,
+                              contrast = i)
+  
+}
+DEM_hm_bin$Cumulative_Breadth_dichot
+  
+              
+
+
+
+```
+
+
+```{r make metabolon_genesets}
+metabolon_gs_df <- inputDF %>%
+                  dplyr::select(CHEMICAL_ID, SUB_PATHWAY) %>%
+                  rowid_to_column(.) %>%
+                  spread(SUB_PATHWAY,CHEMICAL_ID) %>% 
+                  clean_names() %>%
+                  dplyr::select(-rowid) %>%
+                  gather(SUB_PATHWAY,CHEMICAL_ID) %>%
+                  filter(!is.na(CHEMICAL_ID)) %>%
+                  mutate(SUB_PATHWAY = toupper(SUB_PATHWAY)) %>%
+                  mutate(SUB_PATHWAY = paste("METABOLON_", SUB_PATHWAY, sep = "")) %>%
+                  mutate(CHEMICAL_ID = as.character(CHEMICAL_ID)) %>%
+                  distinct(.)
+                  
+metabolon_gs_ls <- split(metabolon_gs_df$CHEMICAL_ID, f= metabolon_gs_df$SUB_PATHWAY)
+
+metabolon_gs <- lapply(names(metabolon_gs_ls), function(x){
+  gs <- GeneSet(setName = x, shortDescription = x, geneIds = metabolon_gs_ls[[x]])
+  return(gs)
+})
+toGmt(con = "input/genesets/metabolon_genesets.gmt", x = GeneSetCollection(metabolon_gs))
+
+
+```
+
+
+Generate SMPDB genesets based on the metabolon data. 
+1. The SMPDB genesets have many metabolites not measured in Metabolon. Quantifying enrichment of molecules not measured reduces sensitivity: its better to filter the SMPDB genesets on the MEtabolon analytes before enrichment.
+2. The SMPDB metabolites use HMDB IDs: the Metabolon data have several analytes that share common HMDB IDs(chiral isoforms, for instance). By using the HMDB IDs, we lose the distinct information those different analytes have: converting the genesets to their respective CHEMICAL_ID (from Metabolon) will allow us to measure enrichment over all Metabolon metabolites (that have an associated HMDB_ID). 
+
+```{r SMPDB_Geneset_transform}
+GSEA_data_Dir <- setup_dir(file.path(dataOutDir,"gsea"))
+
+geneset_list <- list(metabolism = file.path(genesetsDir,
+                                        "smpdb_collection_metabolic.gmt"))
+
+
+convert_to_CHEMICAL <- function(HMDB_geneset, fData){
+  
+}
+
+
+fData_caprion <- readxl::read_excel("input/fData_caprion.xlsx") %>%
+                  mutate(CHEMICAL_ID_temp = CHEMICAL_ID) %>%
+                  dplyr::select(-CHEMICAL_ID) %>%
+                  left_join(., fData %>% dplyr::select(CHEMICAL_ID, HMDB_ID), by = "HMDB_ID") %>%
+                  dplyr::select(BIOCHEMICAL, SUPER_PATHWAY, SUB_PATHWAY, CHEMICAL_ID, HMDB_ID)
+
+
+            
+
+
+for(i in names(geneset_list)){
+  unfilt_gs <- getGmt(geneset_list[[i]])
+  geneIDs_transformed <- list()
+  for(j in 1:length(unfilt_gs)){
+  ### transformation step
+ 
+    description <- description(unfilt_gs[[j]])
+    setName<- setName(unfilt_gs[[j]])
+    geneIds <- geneIds(unfilt_gs[[j]])
+    temp_geneIDs_df <- data.frame(setName, description, geneIds ) %>%
+                      mutate(geneIds = as.character(geneIds)) %>%
+                      mutate(setName = paste("SMPDB_",setName, sep= ""))
+    
+    temp_metab_set <- fData %>%
+                      filter(!is.na(HMDB_ID)) %>%
+                      dplyr::select(HMDB_ID, CHEMICAL_ID) %>%
+                      inner_join(.,temp_geneIDs_df, by = c("HMDB_ID" = "geneIds")) 
+                      # 
+    if(dim(temp_metab_set)[1] > 0){
+      gs <- list(setName = as.character(unique(temp_metab_set$setName)),
+                  shortDescription = as.character(unique(temp_metab_set$description)),
+                  geneIds = temp_metab_set$CHEMICAL_ID)
+    } else {
+      gs <- NA
+    }
+    
+    geneIDs_transformed[[j]] <- gs
+    
+  }
+  geneIDs_transformed <- geneIDs_transformed[!is.na(geneIDs_transformed)]
+  
+  description <- list()
+  setName <- list()
+  geneIds <- list()
+  for(j in 1:length(geneIDs_transformed)){
+    description[[j]] <- geneIDs_transformed[[j]]$shortDescription
+    setName[[j]] <- geneIDs_transformed[[j]]$setName
+    geneIds[[j]] <- sort(geneIDs_transformed[[j]]$geneIds)
+  }
+  
+  
+  #Identify the genesets with unique values 
+  unique_index <- which(!duplicated(geneIds))
+  filt_gs <- list()
+  for(j in 1:length(unique_index)){
+    filt_gs[[j]] <- GeneSet(setName = setName[[unique_index[[j]]]], 
+                            geneIds = geneIds[[unique_index[[j]]]],
+                            shortDescription = description[[unique_index[[j]]]])
+  }
+  outfile <- gsub(".gmt", "_transformed.gmt", geneset_list[[i]])
+  
+  filt_gs <- c(filt_gs,metabolon_gs)
+  toGmt(con = outfile, x = GeneSetCollection(filt_gs))
+  
+}
+
+
+# data.frame(CHEMICAL_ID = geneIds(filt_gs[[49]])) %>%
+#           left_join(.,fData, by = "CHEMICAL_ID")
+# ""
+#  
+# 
+# print(geneIDs_df)
+```
+
+
+```{r mGSEA function}
+
+fgsea_function_metabolon <- function(x,gmtfile, p_thr = 0.05, n.perm = 10000, maxSize = 500, minSize = 5) {
+  ###function to do preranked geneset enrichment using fgsea using a given 1.srunken deseq input and 2.gmt file path
+  
+  metabolon_DEM_output <- x
+  metabolon_DEM_output <- metabolon_DEM_output[!is.na(metabolon_DEM_output$adjp),] %>%
+                          filter(!is.na(CHEMICAL_ID)) %>%
+                          mutate(logp = -log(p.value)) %>%
+                          # group_by(CHEMI) %>%
+                          # mutate(rank_logp = rank(logp)) %>%
+                          # ungroup(.) %>%
+                          # filter(rank_logp == 1) %>%
+                          filter(is.numeric(p.value)) %>%
+                          column_to_rownames("CHEMICAL_ID")
+  
+  
+  metabolon_DEM_output$rank_metric <- sign(metabolon_DEM_output$effect_size) *  metabolon_DEM_output$logp
+  metabolon_DEM_output <- metabolon_DEM_output[order(-metabolon_DEM_output$rank_metric),] 
+  ranks <- metabolon_DEM_output
+  ranks_set <- setNames(ranks$rank_metric, row.names(ranks))
+  
+
+  pathways <- gmtPathways(gmtfile)
+  fgseaRes<-fgsea(pathways,ranks_set,minSize=minSize,maxSize=maxSize,nperm=n.perm)
+  fgseaRes<- fgseaRes[fgseaRes$pval <=p_thr,]
+  fgseaRes<-fgseaRes[order(fgseaRes$padj),]
+  fgseaRes<-fgseaRes[!is.na(fgseaRes$padj),]
+  return(fgseaRes)
+}
+
+fgsea_output_metabolon <- function(fgsea_vector,
+                         eset_contrast,
+                         outcome,
+                         geneset_list,
+                         geneset,
+                         fileDir,
+                         p_thr = 0.05) {
+  if(length(fgsea_vector[[outcome]]) == 0) {
+    fgsea_list <- list()
+  } else {
+    fgsea_list <- fgsea_vector[[outcome]]
+  }
+  fgsea_list[[geneset]]$geneset_file <- geneset_list[[geneset]]
+  fgsea_list[[geneset]]$output <- fgsea_function_metabolon(x = eset_contrast ,
+                                                           geneset_list[[geneset]], 
+                                                           p_thr = p_thr)
+  write_tsv(as.data.frame(fgsea_list[[geneset]]$output[,c(1:7)]), 
+          path=file.path(fileDir,paste(outcome,geneset,"gsea_metabolon.txt", sep="_")), 
+          quote = FALSE)
+  fgsea_vector[[outcome]] <- fgsea_list
+  return(fgsea_vector)
+}
+
+```
+
+
+
+```{r PCS}
+
+
+pcs_filter <- 
+pcs_metab <- metabolon_DEM$Cumulative_Breadth_dichot %>%
+    mutate(padj = p.adjust(p.value)) %>%
+    filter(grepl("cresol|indoxyl", BIOCHEMICAL))
+
+
+```
+
+
+
+
+```{r MSEA}
+
+geneset_list_filtered <- list(metabolism = file.path(genesetsDir,
+                                        "smpdb_collection_metabolic_transformed.gmt"))
+
+metabolon_bin_split <- split(metabolon_bin, f= metabolon_bin$outcome)
+
+
+metabolon_DEM[["Cumulative_Breadth_dichot"]] <- metabolon_bin_split$Cumulative_Breadth_dichot
+metabolon_DEM[["caprion_clusters_bin"]] <- metabolon_bin_split$caprion_clusters_ord
+metabolon_DEM[["Polyvalent_vs_Oligovalent"]] <- unsup_clust_stats_pw$Polyvalent_vs_Oligovalent
+metabolon_DEM[["Polyvalent_vs_Intermediary"]] <- unsup_clust_stats_pw$Polyvalent_vs_Intermediary
+metabolon_DEM[["Intermediary_vs_Oligovalent"]] <- unsup_clust_stats_pw$Intermediary_vs_Oligovalent
+#metabolon_DEM[["D91_Breadth_dichot"]] <- metabolon_bin_split$D91_Breadth_dichot
+fgsea_analysis_metabolon <- list()
+
+
+
+caprion_metab_stat_file <- "../../Caprion_proteomics_metab/Caprion_metabolomics/output/data/export_metab_stats_caprion.csv"
+
+          
+caprion_metab_stats <- sapply(excel_sheets(caprion_metab_stat_file), simplify = F, USE.NAMES = T, function(x){
+    df <- readxl::read_excel(caprion_metab_stat_file, sheet = x) %>%
+            inner_join(., fData_caprion, by = c("metab" = "BIOCHEMICAL")) %>%
+            dplyr::rename(BIOCHEMICAL = "metab")
+  return(df)
+})
+
+capr_metab_comp  <- sapply(names(metabolon_DEM), simplify = F, USE.NAMES = T, function(x){
+      df <- caprion_metab_stats[[x]] %>%
+            #inner_join(., fData_caprion, by = c("metab" = "BIOCHEMICAL")) %>%
+            dplyr::select(CHEMICAL_ID, p.value)  %>%
+            rename(Caprion_p = "p.value")  %>%
+            left_join(., metabolon_DEM[[x]], by = "CHEMICAL_ID")  %>%
+            dplyr::select(CHEMICAL_ID, BIOCHEMICAL, Caprion_p, p.value) %>%
+            rename(Metabolon_p = "p.value")
+  
+})
+
+capr_hmdb_ID <- readxl::read_excel("../../Caprion_proteomics_metab/Caprion_metabolomics/input/Upload for AP 19MAY2020/Metabolites_Immune_Response_IPA_20191211.xlsx", 
+                   skip = 13, sheet = "Metabolites_ID_Mapping_20191210") %>%
+                  dplyr::select(ID, Symbol)
+
+out_metab_uni_aucp <- sapply(names(caprion_metab_stats)[c(3:6)], simplify = F, USE.NAMES = T, function(x){
+  cap <- caprion_metab_stats[[x]] %>%
+            dplyr::select(BIOCHEMICAL, estimate, CHEMICAL_ID, p.value, logp) %>%
+            mutate(adjp = p.adjust(p.value, method = "BH")) %>%
+            rename(rho = "estimate") %>%
+            mutate(source = "Caprion") %>%
+            dplyr::select(BIOCHEMICAL, CHEMICAL_ID, everything())
+  #return(cap)
+  metab <- metabolon_DEM[[x]] %>%
+            ungroup() %>%
+            dplyr::select(BIOCHEMICAL, CHEMICAL_ID,  effect_size, p.value,  adjp) %>%
+            mutate(logp = -log(p.value) * sign(effect_size)) %>%
+            rename(rho = "effect_size") %>%
+            dplyr::select(BIOCHEMICAL, CHEMICAL_ID, rho, p.value, logp, adjp) %>%
+            mutate(source = "METABOLON") %>%
+            bind_rows(cap)
+            
+  return(metab)
+})
+
+
+out_metab_uni_breadth <- sapply(c("Cumulative_Breadth_dichot"), simplify = F, USE.NAMES = T, function(x){
+  cap <- caprion_metab_stats[[x]] %>%
+            dplyr::select(BIOCHEMICAL, CHEMICAL_ID, t, p.value, t ) %>%
+            mutate(adjp = p.adjust(p.value, method = "BH")) %>%
+            #rename(rho = "estimate") %>%
+            mutate(logp = -log(p.value) * sign(t),
+                   source = "Caprion") %>%
+            dplyr::select(-t) %>%
+            dplyr::select(BIOCHEMICAL, CHEMICAL_ID, everything())
+  
+  metab <- metabolon_DEM[[x]] %>%
+            ungroup() %>%
+            dplyr::select(BIOCHEMICAL, CHEMICAL_ID,  effect_size, p.value,  adjp) %>%
+            mutate(logp = -log(p.value) * sign(effect_size)) %>%
+            dplyr::select(-effect_size) %>%
+            dplyr::select(BIOCHEMICAL, CHEMICAL_ID, p.value, adjp, logp) %>%
+            mutate(source = "METABOLON") %>%
+            bind_rows(cap)
+  
+  return(metab)
+})
+
+
+writexl::write_xlsx(c(out_metab_uni_breadth,out_metab_uni_aucp), path = "output/data/univariate_metabolites_DEA.xlsx")
+
+# test <- sapply(names(caprion_metab_stats), simplify = F, USE.NAMES = T, function(x){
+#   
+#   return(test)
+#   df <- caprion_metab_stats[[x]] %>%
+#           left_join(., capr_hmdb_ID, by = c("metab" = "Symbol") )
+# })
+
+#test <- gmtPathways(geneset_list_filtered[["metabolon_metabolism"]])
+
+metabolon_DEM_mod <- sapply(names(metabolon_DEM), simplify = F, USE.NAMES = T, function(x){
+  df_filt <- metabolon_DEM[[x]] %>%
+              filter(!CHEMICAL_ID %in% caprion_metab_stats[[x]]$CHEMICAL_ID)
+  df_cap <- caprion_metab_stats[[x]] %>%
+             mutate(adjp = NA) %>%
+            dplyr::rename(effect_size = "estimate") %>%
+            dplyr::select(colnames(df_filt)) %>%
+            bind_rows(df_filt) %>%
+            arrange(p.value)
+  return(df_cap)
+})
+
+
+fgsea_analysis_metabolon <- list()
+for(i in names(metabolon_DEM_mod)){
+  for(j in names(geneset_list_filtered)) {
+    fgsea_analysis_metabolon <- fgsea_output_metabolon(fgsea_analysis_metabolon,
+                               eset_contrast = metabolon_DEM_mod[[i]],
+                               outcome = i,
+                               geneset_list = geneset_list_filtered,
+                               geneset = j,
+                               fileDir = GSEA_data_Dir,
+                               p_thr = 0.1)
+    if(dim(fgsea_analysis_metabolon[[i]][[j]]$output)[1] >0){
+      print(c(i,j,dim(fgsea_analysis_metabolon[[i]][[j]]$output)[1]))
+    }
+  }
+}
+
+export_fgsea_metab <- sapply(names(fgsea_analysis_metabolon), simplify = F, USE.NAMES = T, function(x){
+  df <- fgsea_analysis_metabolon[[x]]$metabolism$output %>%
+        as.data.frame() %>%
+        unnest(leadingEdge) %>%
+        left_join(., fData %>% dplyr::select(BIOCHEMICAL, CHEMICAL_ID), by = c("leadingEdge" = "CHEMICAL_ID")) %>%
+        group_by(pathway) %>%
+        mutate(LE = paste(BIOCHEMICAL, collapse = "; ")) %>%
+        ungroup(.) %>%
+        dplyr::select(-leadingEdge, -BIOCHEMICAL) %>%
+        unique() %>%
+        dplyr::rename(leadingEdge = "LE")
+})
+
+
+writexl::write_xlsx(export_fgsea_metab, path = "output/msea_export_results.xlsx")
+```
+
+
+```{r MSEA_figures_functions}
+gsea_hm <- function(fgsea_object,
+                    contrasts,
+                    geneset,
+                    pval_thr,
+                    filename, 
+                    clusterRowsGap = TRUE, 
+                    subset = c(),
+                    cleanup =c(),
+                    cleanup_cols= c(), 
+                    top = 30, 
+                    transpose = FALSE,
+                    width = 12,
+                    height = 8,
+                    legend = TRUE,
+                    hm.params){
+  df <- c()
+  
+  contrast_iter <- names(fgsea_object)
+  contrast_iter <- contrast_iter[contrast_iter %in% contrasts]
+  contrast_cols <- contrast_iter
+  top_pathways <- list()
+  for(i in contrast_iter) {
+    if(dim(fgsea_object[[i]][[geneset]][["output"]][1]) > 0){
+      df_temp <- fgsea_object[[i]][[geneset]][["output"]] %>%
+      as.data.frame(.) %>%
+      filter(padj <= pval_thr) 
+
+      top_df <- df_temp %>%
+        arrange(padj)
+      top_pathways[[i]] <-  top_df$pathway
+      
+      df_temp <- df_temp %>%
+        dplyr::select(pathway,NES)
+        colnames(df_temp)[2] <- i
+    } else {
+      df_temp <- c()
+      contrast_cols <- contrast_cols[!contrast_cols == i]
+    } 
+    
+      if(!is.data.frame(df)){
+        df <- df_temp
+      } else if (is.data.frame(df_temp)){
+        df <- merge(df,df_temp, by="pathway", all=TRUE)
+      }
+  } 
+
+  
+  df <- df %>%
+    gather(contrast,NES,-pathway) %>%
+    mutate(NES = ifelse(is.na(NES), 0 , NES)) %>%
+    mutate(NES = as.numeric(NES)) %>%
+    spread(contrast,NES) 
+  df <- df[,c("pathway",contrast_cols)]
+  
+  if(length(subset) > 0){
+    top_grep <- c()
+    
+    for(i in top_pathways){
+      top_grep_temp <- i
+      top_grep <- c(top_grep, top_grep_temp[grepl(subset, top_grep_temp)][1:top])
+    }
+    top_grep <- unique(top_grep)
+    top_grep <- top_grep[!is.na(top_grep)]
+    df <- df %>%
+      filter(grepl(subset,pathway)) %>%
+      filter(pathway %in% top_grep)
+  }
+  
+  
+  
+  hm_object <- list()
+  hm_object$genesets <- df$pathway
+  for(i in names(cleanup)){
+    df$pathway <- gsub(i,cleanup[[i]],df$pathway)
+  }
+  for(i in names(cleanup_cols)){
+    colnames(df) <- gsub(i, cleanup_cols[[i]], colnames(df))
+  }
+  
+  df <- distinct(df, pathway, .keep_all = TRUE) %>%
+    mutate(pathway = toupper(pathway)) %>%
+    column_to_rownames("pathway") %>%
+    as.matrix(.)
+
+  
+  paletteLength <- 500
+  colorLS <- colorRampPalette(colors = c("blue", "cyan",
+                                         "white",
+                                        "yellow", "red"))(paletteLength)
+
+  topScale <- max(abs(min(df)),abs(max(df)))
+  myBreaks <- seq(-topScale, topScale, length.out=paletteLength)
+  hm.parameters <- list(
+    mat = df,
+    color = colorLS,
+    fontsize= 8,
+    cellheight = 14,
+    cellwidth = 14,
+    show_colnames = TRUE,
+    annotation_names_row = FALSE,
+    breaks = myBreaks,
+    cluster_cols = FALSE,
+    angle_col = 45,
+    filename = filename,
+    width = width,
+    height = height,
+    legend = legend
+  )
+    if(transpose == TRUE){
+    hm.parameters$mat <- t(df)
+    hm.parameters$cluster_cols <- TRUE
+    hm.parameters$cluster_rows <- FALSE
+    hm.parameters$treeheight_col <- 5
+    hm.parameters$angle_col <- 315
+  }   
+  
+  
+  
+  if (clusterRowsGap == FALSE) {
+    p <- do.call(pheatmap, hm.parameters)
+    
+    hm_object$clusterRow <- "none"
+  } else {
+    p_temp <- pheatmap(df)
+    
+    cluster_annot <- heatmap_gap_clustering(p_temp, K.max = dim(df)[1] -1 )
+    dev.off()
+    
+    hm.parameters <- list(df,
+                  color = colorLS,
+                  fontsize= 8,
+                  cellheight = 9,
+                  cellwidth = 9,
+                  show_colnames = FALSE,
+                  annotation_names_row = FALSE,
+                  cluster_cols = FALSE,
+                  breaks = myBreaks,
+                  annotation_row = cluster_annot$df["clusterID"],
+                  angle_col = 45)
+    hm.parameters <- c(hm.parameters, hm.params)
+    p <- do.call("pheatmap", hm.parameters) 
+
+    hm_object$clusterRow <- cluster_annot
+  }
+  
+  hm_object$plot <- p
+  hm_object$matrix <- df
+  return(hm_object)
+}
+
+
+
+
+```
+
+```{r }
+
+
+
+```
+
+
+
+```{r enrichment_map}
+
+compute_modules_func_ledge <- function(gsea_output, 
+                                #p_threshold = 0.05,
+                                jaccard_threshold = 0.5, 
+                                filename) {
+  
+  
+  pathDF <- as.data.frame(gsea_output) 
+  #### enrichment map
+  # define nes (1 or -1)
+  nes = 1
+  nes_check <- FALSE
+  outGS_list <- c()
+  while(nes_check == FALSE){
+    if(nes == -1) {
+      leDF <- pathDF %>% dplyr::filter(NES < 0)
+      } else {
+          leDF <- pathDF %>% dplyr::filter(NES > 0)
+      }
+    
+    leLS <- sapply(unique(leDF$pathway), USE.NAMES = T, simplify = F, function(x){
+          if(length(unique(leDF$pathway)) >0 ){
+            
+          
+          out <- pathDF %>%
+                 filter(pathway == x) %>%
+                   separate_rows(leadingEdge, sep= ", ") %>%
+                 .$leadingEdge
+          return(out)
+          } else { 
+            return(NA)
+          }
+      })
+    if(length(leLS) == 0){
+      leLS <- NA
+    }
+    print(leLS)
+    #return(leLS)
+    # leLS <- leDF$leadingEdge 
+    # names(leLS) <- leDF$pathway
+    
+    # calculate Jaccard index
+    if(!is.na(leLS)){
+      
+        gsDist <- sapply(leLS, function(gs1) {
+          gsDist <- sapply(leLS, function(gs2) {
+                      gs1 <- gs1
+                      gs2 <- gs2
+                      jaccardIndex <- length(intersect(gs1, gs2))
+                      jaccardIndex <- jaccardIndex /
+                                      (length(gs1) + length(gs2) - jaccardIndex)
+          return(value = jaccardIndex)
+        })
+          return(value = gsDist)
+      })
+      #return(gsDist)
+        
+      # filter based on jaccard threshold
+      gsMin <- gsDist
+      gsMin[gsMin < jaccard_threshold] <- 0
+  
+      # remove all singletons
+      flag <- rowSums(gsMin) > 1 | colSums(gsMin) > 1
+      #return(flag)
+      gsFilt <- gsMin[flag, flag]
+      
+  
+      # create graph
+      g <- graph.adjacency(gsFilt,
+                           mode = "undirected",
+                           weighted = TRUE,
+                           diag = FALSE)
+      
+      # decompose graph into modules and find most frequent genes of each module
+      gD <- decompose(g)
+      #return(gD)
+    
+  
+      outNet <- lapply(1:length(gD), FUN = function(i) {
+              gsName <- V(gD[[i]])$"name"
+      
+      # select gene frequency based on the gene set size (corrected for the geneSet size)
+      # if size of geneset less than or equal to 4, select to represent greater than 50% geneFreq
+      geneFreq <- sort(table(unlist(leLS[gsName])))
+      if(length(gsName <= 4)) {
+          geneFreq <- geneFreq[geneFreq > 1/2 * length(gsName)]
+      } else {
+          geneFreq <- geneFreq[geneFreq > 1/4 * length(gsName)]
+      }
+      topGS <- gsName
+      geneFreq <- geneFreq[order(geneFreq, decreasing = TRUE)]
+      return(c(gs = paste(topGS, collapse = ","),
+               genes = paste(names(geneFreq), collapse = ","),
+               freq  = paste(geneFreq, collapse = ",")))
+          })
+  
+      outNet <- do.call(what = rbind, outNet)
+    } else {
+      outNet <- c(gs = "--",
+               genes = "--",
+               freq  = "--")
+      }
+    
+    # outGS_list <- c(outGS_list,outNet)
+    #   outGS_list <- c(outGS_list,gsDist)
+    # if(nes == -1){
+    #   nes_check <- TRUE
+    #   outfinal2 <- rbind(outfinal, outNet)
+    # } else {
+    #   nes <- -1
+    #   outfinal <- outNet  
+    # }
+
+    outfinal2 <- outNet  
+    nes_check <- TRUE
+    print(outfinal2)
+  #return(gsDist)
+  }
+  
+  outfinal2 <- data.frame(outfinal2) %>%
+          filter(gs != "--") %>%
+          rowid_to_column("rowid") %>%
+          mutate(module = paste("MODULE_", rowid, sep = "")) %>%
+          separate_rows(gs, sep =",")
+  network_table <- outfinal2 %>%
+                  rename(source = "module",
+                         target = "gs") %>%
+                  dplyr::select(source, target)
+                  
+  modules_topP <- gsea_output %>%
+                    inner_join(., outfinal2, by = c("pathway" = "gs")) %>%
+                    group_by(module) %>%
+                    arrange(desc(abs(NES))) %>%
+                    #mutate(topP = ifelse(abs(logp) == max(abs(logp)), 1, 0)) %>%
+                    mutate(topP  = row_number()) %>%
+                    mutate(topP = ifelse(topP == 1, 1, 0)) %>%
+    
+                    #mutate(topP = ifelse(distinct))
+                    ungroup() %>%
+                    dplyr::select(pathway, topP, module) 
+  module_logp <- gsva_output %>%
+                  inner_join(., modules_topP, by = "pathway") %>%
+                  filter(topP == 1) %>%
+                  dplyr::select(module, NES) 
+  node_table_module <- module_logp %>% rename(node = "module")
+  node_table <- gsva_output %>%
+                    inner_join(., outfinal2, by = c("pathway" = "gs")) %>%
+                    dplyr::select(pathway, NES) %>%
+                    rename(node = "pathway") %>%
+                    bind_rows(node_table_module) %>%
+                    mutate(node_type = ifelse(grepl("MODULE", node), "module", "pathway"))
+                
+  
+                  
+  out <- list("module_select" = modules_topP, "network_table" = network_table, "node_table" = node_table)
+  return(out)
+}
+
+
+```
+
+```{r jaccard_distance_pathways}
+
+breadth_modules <- fgsea_analysis_metabolon$Cumulative_Breadth_dichot$metabolism$output  %>%
+                          filter(pval <0.05) %>%
+                          filter(padj <0.25) %>%
+                          filter(NES > 0) %>%
+                          unnest(leadingEdge) %>%
+                          group_by(pathway) %>%
+                          mutate(LE = paste(leadingEdge, collapse = ", ")) %>%
+                          ungroup() %>%
+                          dplyr::select(-leadingEdge) %>%
+                          dplyr::rename(leadingEdge = "LE") %>%
+                          compute_modules_func_ledge(., filename = "modules_Breadth_metabolomics.csv")
+
+
+
+```
+
+
+
+
+
+```{r MSEA_figures}
+
+
+
+breadth_gsea_barplot <- fgsea_analysis_metabolon$Cumulative_Breadth_dichot$metabolism$output  %>%
+                          filter(pval <0.05) %>%
+                          filter(padj <0.25) %>%
+                          gsea_barplot_func(.)
+ 
+pdf(file = "output/figures/metab_barplot_msea.pdf", width = 10, height = 6)
+breadth_gsea_barplot
+dev.off()
+
+
+gsea_hm(fgsea_object = fgsea_analysis_metabolon,
+        contrasts =  AUCp,
+        geneset = "metabolism",
+        pval_thr =  0.1, 
+        filename = file.path(figureDir,"metabolism_AUCp_MSEA_hm.pdf"), 
+        cleanup=list("_" = " "),
+        clusterRowsGap = FALSE,
+        transpose = FALSE,
+        height = 12)
+
+
+
+gsea_hm(fgsea_object = fgsea_analysis_metabolon,
+        contrasts =  c("Cumulative_Breadth_dichot"),
+        geneset = "metabolism",
+        pval_thr =  0.25, 
+        filename = file.path(figureDir,"metabolism_Cumul_breadth_bin_MSEA_hm.pdf"), 
+        cleanup=list("_" = " "),
+        clusterRowsGap = FALSE,
+        transpose = FALSE,
+        height = 12)
+
+gsea_hm(fgsea_object = fgsea_analysis_metabolon,
+        contrasts =  c("Polyvalent_vs_Oligovalent", "Polyvalent_vs_Intermediary", "Intermediary_vs_Oligovalent",
+                       "caprion_clusters_bin"),
+        geneset = "metabolism",
+        pval_thr =  0.25, 
+        filename = file.path(figureDir,"metabolism_unsupervised_clusters_MSEA_hm.pdf"), 
+        cleanup=list("_" = " "),
+        clusterRowsGap = FALSE,
+        transpose = FALSE,
+        height = 12)
+
+
+fgsea_analysis_metabolon_no_lab <- fgsea_analysis_metabolon
+df_sub <- fgsea_analysis_metabolon$Cumulative_Breadth_dichot$metabolism$output
+df_sub <- df_sub %>%
+          as.data.frame(.) %>%
+          mutate(pathway = gsub("METABOLON_", "", pathway)) %>%
+          mutate(pathway = gsub("SMPDB_", "", pathway)) %>%
+          mutate(pathway = gsub("_", " ", pathway)) 
+
+fgsea_analysis_metabolon_no_lab$Cumulative_Breadth_dichot$metabolism$output <- df_sub
+                 
+gsea_hm(fgsea_object = fgsea_analysis_metabolon_no_lab,
+        contrasts =  c("Cumulative_Breadth_dichot"),
+        geneset = "metabolism",
+        pval_thr =  0.25, 
+        filename = file.path(figureDir,"metabolism_Cumul_breadth_bin_MSEA_hm_no_lab.pdf"), 
+        cleanup=list("_" = " "),
+        clusterRowsGap = FALSE,
+        transpose = FALSE,
+        height = 12)
+
+gsea_hm(fgsea_object = fgsea_analysis_metabolon,
+        contrasts =  c("D91_Breadth_dichot"),
+        geneset = "metabolism",
+        pval_thr =  0.25, 
+        filename = file.path(figureDir,"metabolism_D91_Breadth_dichot_MSEA_hm.pdf.pdf"), 
+        cleanup=list("_" = " ",
+                     "METABOLON" = "",
+                     "SMPDB" = ""),
+        clusterRowsGap = FALSE,
+        transpose = FALSE,
+        height = 12)
+
+```
+
+
+
+```{r extract ledge}
+
+
+ledge_hm(fgsea_df = fgsea_analysis_metabolon$Cumulative_Breadth_dichot$metabolism$output,
+         geneset = "METABOLON_PRIMARY_BILE_ACID_METABOLISM",
+         DEM = metabolon_DEM$Cumulative_Breadth_dichot,
+         inputDF = inputDF,
+         contrast = "Cumulative_Breadth_dichot",
+         pData = pData)
+
+
+sig_D180 <- fgsea_analysis_metabolon$D180_Breadth$metabolism$output
+sig_D180_filt <- sig_D180[sig_D180$pval <0.05,]$pathway
+for(i in sig_D180_filt ){
+ ledge_hm(fgsea_df = fgsea_analysis_metabolon$D180_Breadth$metabolism$output,
+         geneset = i,
+         DEM = metabolon_DEM$D180_Breadth,
+         inputDF = inputDF,
+         contrast = "D180_Breadth",
+         pData = pData) 
+}
+
+
+saveRDS(list("DEM" = metabolon_DEM, "inputDF" = inputDF, fgsea = fgsea_analysis_metabolon), file = file.path(dataOutDir,"outData_D180.RDS"))
+
+
+# ledge_hm(fgsea_df = fgsea_analysis_metabolon$D180_Breadth_bin$metabolism$output,
+#          geneset = "METABOLON_ANDROGENIC_STEROIDS",
+#          DEM = metabolon_DEM$D180_Breadth_bin,
+#          inputDF = inputDF,
+#          contrast = "D180_Breadth_bin",
+#          pData = pData, 
+#          pval_thr = 0.15)
+# 
+
+
+```
+
+
+```{r lasso_fct}
+lasso_no_int <- function(x,y,var_name,directory,family, intercept) {
+  opt_rmse <- 10000
+  for(i in seq(0.1, 1, by = 0.1)){
+    
+  
+    lambdas <- 10^seq(-3, 5, by = .1)
+    if (family == "binomial" | family == "multinomial") {
+      meas_type <- "class"
+    } else {
+      meas_type <- "deviance"
+    }
+    fit <- glmnet(x, y, alpha = i, lambda = lambdas, intercept= intercept, family= family)
+    cv_fit <- cv.glmnet(x,y,alpha = i,nfolds = nrow(x),grouped=FALSE,lambda = lambdas, intercept = intercept, type.measure = meas_type)
+    print(cv_fit)
+    opt_lambda <- cv_fit$lambda.min
+    
+    # x_variance <- predictor_variance
+    # y_variance <- var(y)
+  
+      pred_type <- "link"
+   
+    y_predicted <- predict.glmnet(fit, s = opt_lambda, newx = x, type = pred_type)
+    predict_df <- data.frame(y,y_predicted)
+    # lin <- glance(lm(predict_df$X1 ~predict_df$y))
+    # adj.r.sq <- lin$adj.r.squared
+    # lin.pval <- lin$p.value
+    # sst <- sum(y^2)
+    # sse <- sum((y_predicted - y)^2)
+    # rsq <- 1 - sse / sst
+    
+    tmp_coeffs <- coef(cv_fit, s = "lambda.min")
+    print(tmp_coeffs)
+    df <- data.frame(name = tmp_coeffs@Dimnames[[1]][tmp_coeffs@i + 1], coefficient = tmp_coeffs@x)
+    
+    index <- which(cv_fit$lambda == opt_lambda)
+    rmse <- sqrt(cv_fit$cvm[[index]])
+    if(rmse < opt_rmse){
+      lasso_vector <- list()
+      lasso_vector$df <- df
+      lasso_vector$lambda <- opt_lambda
+      lasso_vector$predict_df <- predict_df
+      lasso_vector$rmse <- rmse
+      lasso_vector$cv_fit <- cv_fit
+      lasso_vector$lm <- glance(lm(predict_df$X1 ~ predict_df$y))
+      lasso_vector$alpha <- i
+      opt_rmse <- rmse
+    }
+  }
+  return(lasso_vector)
+}
+
+
+lasso_fct <- function(x,y, intercept = FALSE, family = "gaussian", alpha = c(1,1), lambda_choice = "lambda.1se",
+                          standardize = TRUE, type.measure = "deviance", predict = "link") {
+  require(glmnet)
+  opt_rmse <- 10000
+  set.seed(1)
+    
+    for(j in seq(alpha[1], alpha[2], by = 0.1)){
+      
+  
+      lambdas <- 10^seq(-5, 5, by = 0.1)
+      
+      fit <- glmnet(x, y, alpha = j, lambda = lambdas, intercept= intercept, family= family, standardize = standardize)
+      cv_fit <- cv.glmnet(x,y,alpha = j,nfolds = nrow(x),grouped=FALSE,lambda = lambdas, intercept = intercept, 
+                          standardize = standardize, type.measure = type.measure)
+      #print(cv_fit)
+      opt_lambda <- cv_fit[[lambda_choice]]
+      
+      
+      y_predicted <- predict(cv_fit, s = opt_lambda, newx = x, type = predict) 
+      
+      predict_df <- data.frame(y,y_predicted)
+  
+      index <- which(cv_fit$lambda == opt_lambda)
+      rmse <- sqrt(cv_fit$cvm[index])
+        
+      tmp_coeffs <- coef(cv_fit, s = lambda_choice)
+      
+      sd <- x %>%
+            as.data.frame(.) %>%
+            gather(Assay, value) %>%
+            group_by(Assay) %>%
+            summarise(sd = sd(value))
+      
+      std_coeffs <- as.data.frame(as.matrix(tmp_coeffs)) %>%
+                    rownames_to_column("Assay") %>%
+                    rename(coefficients = "1") %>%
+                    filter(Assay != "(Intercept") %>%
+                    inner_join(.,sd, by = "Assay") %>%
+                    mutate(std.coeffs = coefficients * sd)
+                    
+                      
+        
+      
+      if(opt_rmse > rmse){
+        lasso_vector <- list()
+        lasso_vector$x <- x
+        lasso_vector$y <- y
+        lasso_vector$tmp_coeffs <- tmp_coeffs
+        lasso_vector$lambda <- opt_lambda
+        lasso_vector$lambda_choice <- lambda_choice
+        lasso_vector$predict_df <- predict_df
+        lasso_vector$rmse<- rmse
+        lasso_vector$fit <-  fit
+        lasso_vector$cv_fit <- cv_fit
+        lasso_vector$lm <- glance(lm(predict_df$X1 ~ predict_df$y))
+        lasso_vector$alpha <- j
+        lasso_vector$std_coeffs <- std_coeffs
+        opt_rmse <- rmse
+      }
+    }
+  if(opt_rmse == 10000){
+    lasso_vector <- NA
+  }
+  
+
+  return(lasso_vector)
+}
+
+```
+
+
+```{r multivariate analysis}
+feat_matr <- inputDF %>%
+        dplyr::select(CHEMICAL_ID, BIOCHEMICAL, sample_ids,  value) %>%
+        dplyr::filter(!is.na(CHEMICAL_ID)) %>%
+        distinct(.) %>%
+        inner_join(., pData, by ="sample_ids") %>%
+        filter(Immune_status_at_baseline == "Naive" & Vaccine_status == "Vaccine") %>%
+        dplyr::select(BIOCHEMICAL, PID, value) %>%
+        #filter(sample_ids %in% samples_filt) %>%
+        spread(BIOCHEMICAL, value) %>%
+        column_to_rownames("PID") %>%
+        as.matrix()
+        #dplyr::select(-BIOCHEMICAL) %>%
+        #inner_join(.,tidy_stats, by =  "CHEMICAL_ID") %>%
+        # mutate(slogp = -log2(p.value) * sign(effect_size)) %>%
+        # mutate(SUB_PATHWAY_FILT = ifelse(SUPER_PATHWAY == "Lipid", SUB_PATHWAY, NA)) %>%
+        # arrange(SUPER_PATHWAY, SUB_PATHWAY_FILT, slogp) %>%
+        # dplyr::select(CHEMICAL_ID, samples_filt) %>%
+        # # filter(complete.cases(.)) %>%
+        # # dplyr::select(-contrast) %>%
+        # filter(CHEMICAL_ID %in% sig_analytes) %>%
+        # column_to_rownames("CHEMICAL_ID") %>%
+        # as.matrix(.)
+
+
+lasso <- sapply(colnames(outcome_df)[c(5:10)], simplify = F, USE.NAMES = T, function(i){
+  
+  feature_list <- colnames(feat_matr)
+  y_temp <- outcome_df[,c("PID",i)] 
+  # repl_index <- which(colnames(y_temp == i))
+  # colnames(y_temp)[repl_index] <- "
+  feat_matr_x <- feat_matr %>%
+              as.data.frame(.) %>%
+              rownames_to_column("PID") %>%
+              inner_join(y_temp , by = "PID") 
+  feat_matr_x <- feat_matr_x[!is.na(feat_matr_x[[i]]),]
+  y <- feat_matr_x[[i]]
+  if(grepl("Breadth", i)){
+    y <- gsub("high", 2, y)
+    y <- as.numeric(gsub("low", 1, y))
+  }
+  # return(feat_matr_x)
+  x <- feat_matr_x %>%
+            dplyr::select(c("PID",feature_list)) %>%
+            as.data.frame(.) %>% 
+            remove_rownames(.) %>%
+            column_to_rownames("PID") %>%
+            as.matrix(.)
+  
+    if(grepl("AUC", i)){
+    family <- "gaussian"
+    prediction <- "link"
+    type.measure <- "deviance"
+  } else if(grepl("Breadth", i)){
+    family <- "binomial"
+    type.measure <- "mse"
+    prediction <- "class"
+  } else {
+    family <- "multinomial"
+    type.measure <- "mse"
+    prediction <- "class"
+  }
+  #return(list("family" = family, "type.measure" = type.measure))
+  lasso <- lasso_fct(x = x, y = y, intercept = F, family = family, alpha = c(0.5,1), lambda_choice = "lambda.min",
+                          standardize = T, type.measure = type.measure, predict = prediction)
+  return(lasso)
+  #return(x)
+
+})
+
+
+AUROC_lasso_bin <- function(lasso_binary_prediction){
+  require(ROCit)
+  df <- lasso_binary_prediction %>%
+        mutate(X1 = X1 -1,
+               y = y -1)
+  
+  p <- rocit(score = df$X1, class = df$y)
+  return(p)
+}
+
+
+lasso_continuous_plot <- function(lasso_prediction){
+  
+  
+}
+
+test <- lasso$Cumulative_Breadth_dichot$std_coeffs
+test <- test[test$std.coeffs >0,] %>% as.data.frame() %>% remove_rownames() %>%  column_to_rownames("Assay")
+
+lasso_filt <- sapply(names(lasso), simplify = F, USE.NAMES = T, function(x){
+  df <- lasso[[x]]$std_coeffs %>%
+          as.data.frame() %>%
+          filter(std.coeffs > 0) 
+  
+  
+})
+
+test <- lasso_continuous_plot(lasso$DV1_AUCp_log)
+
+cumul_predict <- lasso$Cumulative_Breadth_dichot$predict_df %>%
+                  mutate(X1 = X1-1,
+                         y = y-1)
+cumul_ROC <- AUROC_lasso_bin(cumul_predict)
+pdf("output/figures/ROC_lasso_cumulBr_Metabolon.pdf")
+plot(cumul_ROC)
+dev.off()
+
+
+lapply(names(lasso))
+
+
+feat_matr_export <- feat_matr %>%
+                    as.data.frame(.) %>%
+                    rownames_to_column("PID") %>%
+                    gather(feature, value, -PID)
+
+write.table(feat_matr_export, "output/data/feature_matrix_export.txt", quote = F, sep = "!")
+
+```
+
+
+
+```{r export_mixomics}
+export_gs_raw <-  fgsea_analysis_metabolon$Cumulative_Breadth_dichot$metabolism$output %>%
+                  unnest(leadingEdge)
+
+gs_edge_table <- export_gs_raw %>%
+                inner_join(.,fData, by = c("leadingEdge" = "CHEMICAL_ID")) %>%
+                dplyr::select(pathway, BIOCHEMICAL) %>%
+                unique(.) %>%
+                mutate(edge_value = "NONE") %>%
+                rename(source = "pathway") %>%
+                rename(target = "BIOCHEMICAL")
+
+write.table(gs_edge_table, file = file.path(dataOutDir, "metabolon_gs_edge_table.csv"),
+          quote = FALSE, row.names = FALSE, sep ="!")
+
+gs_node_table <- export_gs_raw %>%
+                mutate(value = sign(NES)) %>%
+                dplyr::select(pathway, value) %>%
+                mutate(category = "Metabolic_set") %>%
+                unique(.) %>%
+                rename(node = "pathway")
+
+write.table(gs_node_table, file = file.path(dataOutDir, "metabolon_gs_node_table.csv"),
+          quote = FALSE, row.names = FALSE, sep = "!")
+
+
+
+metabolite_node_table <- metabolon_DEM$Cumulative_Breadth_dichot %>%
+                          ungroup(.) %>%
+                          inner_join(.,unique(as.data.frame(export_gs_raw)["leadingEdge"]), 
+                                     by = c("CHEMICAL_ID" = "leadingEdge")) %>%
+                          mutate(value = sign(effect_size)) %>%
+                          dplyr::select(BIOCHEMICAL, value) %>%
+                          mutate(category = "metabolite") %>%
+                          rename(node = "BIOCHEMICAL")
+
+write.table(metabolite_node_table, file = file.path(dataOutDir, "metabolon_metabolite_node_table.csv"),
+          quote = FALSE, row.names = FALSE, sep ="!")
+
+
+metabolon_mixomics_export_table <- inputDF %>%
+                                    inner_join(.,unique(as.data.frame(export_gs_raw)["leadingEdge"]), 
+                                               by = c("CHEMICAL_ID" = "leadingEdge")) %>%
+                                    dplyr::select(PID, BIOCHEMICAL, value ) 
+
+
+write.table(metabolon_mixomics_export_table, file = file.path(dataOutDir, "metabolon_mixomics_ecport.csv"),
+          quote = FALSE, row.names = FALSE, sep = "!")
+                                    
+
+
+
+##selected features
+
+gs_edge_table_select <- gs_edge_table %>%
+                  filter(grepl("SPHINGOMYELINS|PHOSPHATIDYL|MONOACYLGLYCEROL|BILE", source)) %>%
+                  mutate(new = ifelse(grepl("PHOSPHATIDYLCHOLINE",source), "PHOSPHATIDYLCHOLINE", source)) %>%
+                  mutate(new = ifelse(grepl("PHOSPHATIDYLETHANOLAMINE",new), "PHOSPHATIDYLETHANOLAMINE", new)) %>%
+                  mutate(new = ifelse(grepl("BILE_ACID",new), "BILE_ACID_BIOSYNTHESIS", new)) %>%
+                  mutate(new = gsub("METABOLON|SMPDB", "", new)) %>%
+                  mutate(new = gsub("^_", "", new)) %>%
+                  unique(.)
+
+
+
+
+gs_node_table_select <- export_gs_raw %>%
+                inner_join(gs_edge_table_select, by = c("pathway" = "source")) %>%
+                dplyr::select(-pathway, -edge_value) %>%
+                rename(pathway = "new") %>%
+                mutate(value = sign(NES)) %>%
+                dplyr::select(pathway, value) %>%
+                mutate(category = "Metabolic_set") %>%
+                unique(.) %>%
+                rename(node = "pathway")
+
+
+gs_edge_table_select_out <- gs_edge_table_select %>%
+                      dplyr::select(-source) %>%
+                      rename(source = "new")
+
+write.table(gs_edge_table_select_out, file = file.path(dataOutDir, "metabolon_gs_edge_table_select.csv"),
+          quote = FALSE, row.names = FALSE, sep ="!")
+
+
+write.table(gs_node_table_select, file = file.path(dataOutDir, "metabolon_gs_node_table_select.csv"),
+          quote = FALSE, row.names = FALSE, sep = "!")
+
+
+
+
+export_gs_raw_select <-  export_gs_raw %>%
+                        filter(pathway %in% gs_edge_table_select$source)
+metabolite_node_table_select <- metabolon_DEM$Cumulative_Breadth_dichot %>%
+                          ungroup(.) %>%
+                          inner_join(.,unique(as.data.frame(export_gs_raw_select)["leadingEdge"]), 
+                                     by = c("CHEMICAL_ID" = "leadingEdge")) %>%
+                          mutate(value = sign(effect_size)) %>%
+                          dplyr::select(BIOCHEMICAL, value) %>%
+                          mutate(category = "metabolite") %>%
+                          rename(node = "BIOCHEMICAL") 
+            
+
+write.table(metabolite_node_table_select, file = file.path(dataOutDir, "metabolon_metabolite_node_table_select.csv"),
+          quote = FALSE, row.names = FALSE, sep ="!")
+
+
+metabolon_mixomics_export_table_select <- inputDF %>%
+                                    inner_join(.,unique(as.data.frame(export_gs_raw_select)["leadingEdge"]), 
+                                               by = c("CHEMICAL_ID" = "leadingEdge")) %>%
+                                    dplyr::select(PID, BIOCHEMICAL, value ) 
+
+
+write.table(metabolon_mixomics_export_table_select, file = file.path(dataOutDir, "metabolon_mixomics_ecport_select.csv"),
+          quote = FALSE, row.names = FALSE, sep = "!")
+                                    
+
+
+
+
+
+```
+
+
+
+```{r data_sharing}
+metabolon_PID_matrix <- inputDF %>%
+                        dplyr::select(PID, TIME_POINT, CHEMICAL_ID, BIOCHEMICAL, 
+                                      SUPER_PATHWAY, SUB_PATHWAY, HMDB_ID, value) %>%
+                        spread(PID, value)
+   
+library(writexl)   
+write_xlsx(metabolon_PID_matrix, path = file.path(dataOutDir, "metabolon_PID_matrix.xlsx"))
+
+stats_export <- sapply(names(metabolon_DEM), USE.NAMES = TRUE, simplify = FALSE, function(x){
+  if(grepl("Breadth",x)){
+    df <- metabolon_DEM[[x]] %>%
+          dplyr::rename(mean_high = "estimate1") %>%
+          dplyr::rename(mean_low = "estimate2") %>%
+          dplyr::select(-parameter, -conf.low, -conf.high)
+  } else {
+    df <- metabolon_DEM[[x]]
+  }
+  
+  return(df)
+})
+
+write_xlsx(stats_export, path = file.path(dataOutDir, "metabolon_statistical_comparison.xlsx"))
+
+
+fgsea_analysis_metabolon_filt <- fgsea_analysis_metabolon[names(fgsea_analysis_metabolon) %in% names(metabolon_DEM)] %>%
+  
+fgsea_analysis_export <- sapply(names(fgsea_analysis_metabolon_filt), simplify = FALSE, USE.NAMES = TRUE, function(x){
+            df <- fgsea_analysis_metabolon_filt[[x]]$metabolism$output %>%
+                  unnest(leadingEdge) %>%
+                  group_by(pathway) %>%
+                  mutate(vector = paste(leadingEdge, collapse = ",")) %>%
+                  dplyr::select(-leadingEdge) %>%
+                  dplyr::rename(leadingEdge = "vector") %>%
+                  unique(.)
+})  
+                                 
+write_xlsx(fgsea_analysis_export, path = file.path(dataOutDir,"fgsea_analysis_export.xlsx"))
+```
+
+```{r enrichment_map}
+enMap_breadth_prep <- fgsea_analysis_metabolon_filt$Cumulative_Breadth_dichot$metabolism$output %>%
+                        unnest(cols = 'leadingEdge') %>%
+                        group_by(pathway ) %>%
+                        mutate(ledge = paste(leadingEdge, collapse = '; ')) %>%
+                        dplyr::select(-leadingEdge) %>%
+                        dplyr::rename(leadingEdge = "ledge") %>%
+                        unique()
+
+module_metab <- compute_modules_func_ledge(enMap_breadth_prep, jaccard_threshold = 0.05, 
+                           filename = file.path(dataOutDir, 'breadth_enMap_metabolon.txt'),
+                           direction = 'both', p_integration_method = 'minp')
+
+module_metab_annot <- read_tsv(file.path(dataOutDir,'breadth_enMap_metabolon_annot.txt'))
+
+enMap_breadth_prep_upd <- substitute_modules(module_table = module_metab_annot, 
+                                             fgsea_table = enMap_breadth_prep)
+
+
+breadth_gsea_barplot_modules <- enMap_breadth_prep_upd  %>%
+                          mutate(metabcount = str_count(leadingEdge, "!") +1) %>%
+                          mutate(metabcount = metabcount + str_count(leadingEdge, ";") ) %>%
+                          filter(metabcount >=  5) %>%
+                          dplyr::select(-metabcount) %>%
+                          filter(pval <0.05) %>%
+                          mutate(logp = -log10(pval) * sign(NES)) %>%
+                          mutate(oldName = pathway) %>%
+                          mutate(pathway = gsub('METABOLON_', '', pathway)) %>%
+                          #filter(padj <0.25) %>%
+                          gsea_barplot_func(., column = "logp", ylabel = "signed -log10(p')") +
+                          labs(fill = "") +
+                          theme(legend.position = "bottom")
+ 
+ggsave(filename = "output/figures/metab_barplot_msea_modules.pdf", width = 5, height = 4, 
+     units = 'in', device = "pdf",
+      dpi = 300, plot = breadth_gsea_barplot_modules)
+
+enMap_DV3_prep <- fgsea_analysis_metabolon_filt$DV3_AUCp_log$metabolism$output %>%
+                        unnest(cols = 'leadingEdge') %>%
+                        group_by(pathway ) %>%
+                        mutate(ledge = paste(leadingEdge, collapse = '; ')) %>%
+                        dplyr::select(-leadingEdge) %>%
+                        dplyr::rename(leadingEdge = "ledge") %>%
+                        unique()
+
+module_metab_DV3 <- compute_modules_func_ledge(enMap_DV3_prep, jaccard_threshold = 0.05, 
+                           filename = file.path(dataOutDir, 'DV3_enMap_metabolon.txt'),
+                           direction = 'both', p_integration_method = 'minp')
+
+module_metab_DV3_annot <- read_tsv(file.path(dataOutDir,'DV3_enMap_metabolon_annot.txt'))
+
+enMap_DV3_prep_upd <- substitute_modules(module_table = module_metab_DV3_annot, 
+                                             fgsea_table = enMap_DV3_prep)
+
+dv3_gsea_barplot_modules <- enMap_DV3_prep_upd  %>%
+                              mutate(metabcount = str_count(leadingEdge, "!") +1) %>%
+                          mutate(metabcount = metabcount + str_count(leadingEdge, ";") ) %>%
+                          filter(metabcount >=  5) %>%
+                          dplyr::select(-metabcount) %>%
+                          filter(pval <0.05) %>%
+                          mutate(oldName = pathway) %>%
+                          mutate(pathway = gsub('METABOLON_', '', pathway)) %>%
+                          mutate(pathway = gsub('SMPDB_', '', pathway)) %>%
+                          #filter(padj <0.25) %>%
+                          gsea_barplot_func(.)
+
+ggsave(filename = "output/figures/metab_barplot_msea_modules_dv3.pdf", width = 5, height = 2.5, 
+     units = 'in', device = "pdf",
+      dpi = 300, plot = dv3_gsea_barplot_modules)
+
+
+
+ledge_hm(fgsea_df = fgsea_analysis_metabolon$Cumulative_Breadth_dichot$metabolism$output,
+         geneset = "METABOLON_PRIMARY_BILE_ACID_METABOLISM",
+         DEM = metabolon_DEM$Cumulative_Breadth_dichot,
+         inputDF = inputDF,
+         contrast = "Cumulative_Breadth_dichot",
+         pData = pData)
+
+
+ledge_hm(fgsea_df = fgsea_analysis_metabolon$Cumulative_Breadth_dichot$metabolism$output,
+         geneset = "METABOLON_PRIMARY_BILE_ACID_METABOLISM",
+         DEM = metabolon_DEM$Cumulative_Breadth_dichot,
+         inputDF = inputDF,
+         contrast = "Cumulative_Breadth_dichot",
+         pData = pData)
+
+
+
+```
+
+```{r gsva_modules}
+metab_breadth_gsva <- gsva_func(fgsea_table = enMap_breadth_prep_upd, inputDF = inputDF )
+
+
+ledge_matr_breadth <- make_ledge_matr(enMap_breadth_prep_upd[enMap_breadth_prep_upd$pathway %in%
+                                    breadth_gsea_barplot_modules$data$oldName,], 
+                  DEM =metabolon_DEM$Cumulative_Breadth_dichot,
+                   inputDF = inputDF,
+                    pval_thr = 0.5,
+                    contrast = "Cumulative_Breadth_dichot",
+                    pData = pData, sep = "! " )
+
+ledge_matr_breadth_TCA <- make_ledge_matr(enMap_breadth_prep_upd[enMap_breadth_prep_upd$pathway == "METABOLON_TCA_CYCLE" ,], 
+                  DEM =metabolon_DEM$Cumulative_Breadth_dichot,
+                   inputDF = inputDF,
+                    pval_thr = 0.5,
+                    contrast = "Cumulative_Breadth_dichot",
+                    pData = pData, sep = "! " )
+
+select_order_metab <- enMap_breadth_prep_upd[c(1,4),] %>% 
+                      separate_rows(., leadingEdge, sep = "! ") %>%
+                      inner_join(., metabolon_DEM$Cumulative_Breadth_dichot, 
+                                 by = c("leadingEdge" = "CHEMICAL_ID")) %>%
+                      .$BIOCHEMICAL
+
+test <- ledge_hm_combined(enMap_breadth_prep_upd[enMap_breadth_prep_upd$pathway %in%
+                                                   breadth_gsea_barplot_modules$data$oldName,], 
+                  DEM =metabolon_DEM$Cumulative_Breadth_dichot,
+                   inputDF = inputDF,
+                    pval_thr = 0.25,
+                    contrast = "Cumulative_Breadth_dichot",
+                    pData = pData, 
+                  sep = "! ",
+                  #rowlogp = hm_logp_annot,
+                  order_method = "pos_avg", 
+                  order_features =  select_order_metab,
+      
+                  heatmap_attributes = list(height = 20,
+                                            width = 18,
+                                            cluster_rows = F,
+                                            cluster_col = F,
+                                            show_colnames = F,
+                                            annotation_names_row = T,
+                                            cellwidth = 3,
+                                            cellheight = 6,
+                                            fontsize = 6,
+                                            clustering_method = 'complete',
+                                            filename = file.path(figureDir,
+                                                                 "ledge_module_metab.pdf")))
+# test <- ledge_hm_combined(enMap_breadth_prep_upd[enMap_breadth_prep_upd$pathway == "METABOLON_TCA_CYCLE",], 
+#                   DEM =metabolon_DEM$Cumulative_Breadth_dichot,
+#                    inputDF = inputDF,
+#                     pval_thr = 0.5,
+#                     contrast = "Cumulative_Breadth_dichot",
+#                     pData = pData, sep = "! ",
+#                   rowlogp = hm_logp_annot,
+#                   order_method = "pos_avg", 
+#                   #order_features =  select_order_metab,
+#       
+#                   heatmap_attributes = list(height = 20,
+#                                             width = 18,
+#                                             cluster_rows = F,
+#                                             cluster_col = F,
+#                                             show_colnames = F,
+#                                             annotation_names_row = T,
+#                                             cellwidth = 3,
+#                                             cellheight = 6,
+#                                             fontsize = 6,
+#                                             clustering_method = 'complete',
+#                                             filename = file.path(figureDir,
+#                                                                  "ledge_module_metab_TCA.pdf")))
+
+library(ggpubr)
+tca_metab <- ledge_matr_breadth_TCA$ledge_matrix %>%
+              as.data.frame() %>%
+              rownames_to_column("metabolite") %>%
+              gather(PID, zscore, -metabolite) %>%
+              inner_join(., pData_annot, by = "PID") %>%
+              ggplot(., aes(x = Cumulative_Breadth_dichot, y = zscore, 
+                        color = PID)) +
+              geom_point() +
+              facet_wrap(~metabolite) +
+              theme_bw()
+                        
+                      
+
+ggsave(tca_metab, filename = "output/figures/tca_metabolites.pdf", width = 10)                        
+                          
+                          
+
+
+ggpubr()
+
+
+dv_sero_corr_modules <- as.data.frame(metab_breadth_gsva) %>%
+                        rownames_to_column('pathway') %>%
+                        gather(PID, score, -pathway) %>%
+                        inner_join(., outcome_df_filt , by ="PID") %>%
+                        dplyr::select(pathway, PID, score, DV1_AUCp_log,
+                                      DV2_AUCp_log, DV3_AUCp_log, DV4_AUCp_log) %>%
+                        gather(serotype, auc, -pathway, -PID, -score) %>%
+                        group_by(pathway, serotype) %>%
+                        do(model = cor.test(.$score, .$auc, method = "spearman")) %>%
+                        tidy(., model) %>%
+                        ungroup()
+
+
+```
+
+
+
+```{r test batches}
+
+inputMat <- inputDF %>%
+              dplyr::select(PID, CHEMICAL_ID, value) %>%
+              spread(PID, value) %>%
+              column_to_rownames("CHEMICAL_ID") %>%
+              as.matrix(.) 
+
+restDF <- read.csv("../../RNA_Seq/2nd_run/F18FTSUSAT1098_HUMhvtN/all_files/file_rename_schema.csv") %>%
+            dplyr::select(PID) %>%
+            mutate(Batch = 2)
+pilotDF <- read.csv("../../RNA_Seq/Pilot_17patients/data/counts/First_run_BGI/file_rename_schema.csv") %>%
+           mutate(PID = str_extract(original, "DEN[0-9]+A")) %>%
+          dplyr::select(PID) %>%
+          unique(.) %>%
+          mutate(Batch = 1)
+
+
+
+batchIDs <- rbind(pilotDF, restDF) %>%
+              unique(.) %>%
+              group_by(PID) %>%
+              mutate(count = n()) %>%
+              ungroup(.) %>%
+              mutate(keep = ifelse(count == 1, "yes", 
+                                   ifelse( count > 1 & Batch == 1, "yes", "no"))) %>%
+              filter(keep == "yes")
+          
+pcaMat <- prcomp(t(inputMat), scale. = F)
+pcaDF <- pcaMat$x %>%
+        as.data.frame(.) %>%
+        rownames_to_column("PID") %>%
+        filter(!PID %in% c("DEN1003A", "DEN1043A", "DEN1042A")) %>%
+        inner_join(., batchIDs, by = "PID") %>%
+        mutate(Batch = as.character(Batch))
+eigs<- as.data.frame(summary(pcaMat)$importance)
+
+metab_batch_pca <- ggplot(pcaDF, aes(x = PC1, y = PC2, color = Batch)) +
+      geom_point() + 
+      theme_bw() + 
+      xlab(paste("PC1 (", signif(eigs$PC1[2]*100, digits = 4), "%)", sep = "" )) + 
+      ylab(paste("PC2 (", signif(eigs$PC2[2]*100, digits = 4), "%)", sep = "" )) 
+
+pdf(file.path(figureDir,"pca_metab.pdf"))
+metab_batch_pca
+dev.off()
+      #geom_label(aes(label = PID))
+
+
+outcomeMat<- outcome_df_filt %>%
+              dplyr::select(-Group, -Immune_status_at_baseline, -Vaccine_status, 
+                            -Cumulative_Breadth_dichot, -D91_Breadth_dichot ) %>%
+              gather(outcome, value, -PID) %>%
+              # mutate(value = ifelse(value == "high", 1, ifelse(value == "low", 0, value))) %>%
+              # mutate(value = as.numeric(value)) %>%
+              spread(PID, value) %>%
+              column_to_rownames("outcome") %>%
+              as.matrix(.)
+
+pcaMat_outcomes <- prcomp(t(outcomeMat))
+pcaDF_outcomes <- pcaMat_outcomes$x %>%
+        as.data.frame(.) %>%
+        rownames_to_column("PID") %>%
+        #filter(!PID %in% c("DEN1003A", "DEN1043A", "DEN1042A")) %>%
+        inner_join(., batchIDs, by = "PID") %>%
+        mutate(Batch = as.character(Batch))
+
+eigs_outcomes <- as.data.frame(summary(pcaMat_outcomes)$importance)
+
+
+batch_pca_outcomes <- ggplot(pcaDF_outcomes, aes(x = PC1, y = PC2, color = Batch)) +
+      geom_point() + 
+      theme_bw() +
+      xlab(paste("PC1 (", signif(eigs_outcomes$PC1[2]*100, digits = 4), "%)", sep = "" )) + 
+      ylab(paste("PC2 (", signif(eigs_outcomes$PC2[2]*100, digits = 4), "%)", sep = "" )) 
+
+pdf(file.path(figureDir,"pca_outcomes.pdf"))
+batch_pca_outcomes
+dev.off()
+
+
+```
+
+
+
+```{r zscore_metabolon}
+# transcrip_gsva <- read.csv("../../RNA_Seq/output/data/transcriptomic_selected_gs_gsva.csv") %>% 
+#                     dplyr::select(-X)
+
+transcrip_gsva <- read_tsv("../../RNA_Seq/output/data/transc_gsva_matrix.txt") %>%
+                        column_to_rownames('X1') %>%
+                        t() %>%
+                        as.data.frame() %>%
+                        rownames_to_column('PID')
+                            #sep = '\t') %>% 
+                    
+
+
+gsMetab <- getGmt(geneset_list_filtered$metabolism)
+
+
+
+
+```
+
+
+
+```{r integrate metab_w_trans}
+
+metabolon_select <- enMap_breadth_prep_upd %>%
+                      top_n(n = 2, wt = abs(logp)) %>%
+                      .$pathway
+
+meta_tran_int <- as.data.frame(t(ledge_matr_breadth$ledge_matrix)) %>%
+                  rownames_to_column('PID') %>%
+                  filter(PID %in% transcrip_gsva$PID) %>%
+                  inner_join(., transcrip_gsva, by ="PID") %>%
+                  gather(transc_path, tr_zscore, colnames(transcrip_gsva)[2:length(colnames(transcrip_gsva))]) %>%
+                  gather(metabolite, metab_zscore, row.names(ledge_matr_breadth$ledge_matrix)) %>%
+                  group_by(transc_path, metabolite) %>%
+                  do(model = cor.test(.$tr_zscore, .$metab_zscore, method = "spearman")) %>%
+                  tidy(., model) %>%
+                  filter(p.value < 0.05) %>%
+                  ungroup() %>%
+                  mutate(metabolite = gsub("_", " ", metabolite)) %>%
+                  mutate(transc_path = gsub("[.]", " ", transc_path)) %>%
+                  inner_join(., ledge_matr_breadth$ledge_annot, 
+                             by = c('metabolite' = 'BIOCHEMICAL')) %>%
+                  mutate(metabolite = gsub("[(].*", "", metabolite)) %>%
+                  filter(pathways %in% metabolon_select)
+      
+
+trans_node_raw <- read_tsv("../../RNA_Seq/output/data/node_table_transc_jaccard.txt") 
+trans_node__immune_raw <- trans_node_raw %>%
+              mutate(dir = sign(logp)) %>%
+              mutate(logp = ifelse(!node %in% meta_tran_int$transc_path, 0, logp)) %>%
+              #arrange(desc(abs(logp))) %>%
+              group_by(dir, node_type) %>%
+              
+              mutate(rank = rank(desc(abs(logp)))) %>%
+              arrange(node_type, dir, rank) %>%
+              ungroup() %>%
+              mutate(select = ifelse( rank <= 10, 1, 2 )) %>% 
+              mutate(select = ifelse(node_type == 'metab', 3, select )) #%>%
+              # mutate(select = ifelse(!node %in% meta_tran_int$transc_path & select == 1,
+              #                        2, select ))
+
+select_immune <- trans_node__immune_raw[trans_node__immune_raw$select == 1,]$node
+            
+#identify metabolites correlated to immune pathwways
+select_metabolites <- meta_tran_int %>%
+                      filter(metabolite %in%
+              unique(meta_tran_int[meta_tran_int$transc_path %in% select_immune,]$metabolite)) %>%
+                dplyr::select(metabolite) %>%
+                unique() %>% .$metabolite
+
+# test <-  meta_tran_int %>%
+#           #group_by(transc_path) %>%
+#           group_by(pathways) %>%
+#           mutate(minp = min(p.value)) %>%
+#           ungroup() %>%
+#           dplyr::select(pathways, minp) %>%
+#           #dplyr::select(transc_path, minp) %>%
+#           unique() %>%
+#           arrange(desc(minp)) %>%
+#           mutate(rank = rank(minp))
+#           mutate(n_path = n_distinct(pathways),
+#                  path_coll = paste(pathways, collapse = '; ')) %>%
+#           ungroup() %>%
+#           dplyr::select(-pathways) %>%
+#           unique()
+
+
+
+tr_matr_gsva <- read_tsv("../../RNA_Seq/output/data/transc_gsva_matrix.txt") %>%
+                  gather(PID, zscore, -row) %>%
+                  spread(row, zscore)
+                  
+
+combo_trans <- unlist(lapply(combn(colnames(tr_matr_gsva), m = 2, simplify = F), function(x){
+    out <- paste(x[1], x[2], sep = "__")
+}))
+  
+trans_corr_raw <- tr_matr_gsva %>%
+                rownames_to_column("PID") %>%
+                gather(pathway1, value1, -PID) %>%
+                inner_join(., tr_matr_gsva %>% rownames_to_column("PID"), by = "PID") %>%
+                gather(pathway2, value2, -PID, -pathway1, -value1) %>%
+                # filter(grepl(paste(paste(trans_node__immune_raw$node,collapse = "|") ,
+                #                    paste(trans_node_raw[trans_node_raw$node_type == "metab",]$node,
+                #                    collapse = "|"), sep  = "|"), pathway1 )) 
+                mutate(combo = paste(pathway1, pathway2, sep = "__")) %>%
+                filter(combo %in% combo_trans) %>%
+                group_by(combo) %>%
+                do(model = cor.test(.$value1, .$value2, method = "spearman")) %>%
+                tidy(., model) %>%
+                ungroup() %>%
+                filter(p.value < 0.01) %>%
+                #filter(grepl(paste(test$node, collapse = "|"), combo))
+                separate(combo, into = c("source","target"), sep = "__", remove = F) %>%
+                filter(combo %in% combo_trans)
+
+
+metab_filter_out <- trans_node__immune_raw %>%
+                        filter(select == 3) %>%
+                        filter(!grepl(paste(c('ATF4', "Lipid cat", 'NAD met', "Phospha"), 
+                                           collapse = "|"), node)) %>%
+                        .$node %>%
+                        paste(., collapse = "|")
+
+trans_corr_immune <- trans_corr_raw %>%
+              filter(grepl(paste(select_immune,collapse = "|") , combo)) %>%
+              filter(!grepl(metab_filter_out, combo)) %>%
+              filter(!grepl(paste(trans_node__immune_raw[trans_node__immune_raw$select == 2,]$node,
+                                 collapse = "|"), combo)) %>%
+              mutate(logp = -log(p.value) * sign(estimate))
+              
+
+corr_trans_path <- paste(unique(union(trans_corr_immune$source, trans_corr_immune$target)),
+                         collapse = "|")
+
+
+
+
+meta_tran_int_filt <- meta_tran_int %>%
+                      filter(grepl(corr_trans_path, transc_path)) %>%
+                      dplyr::rename(source = "transc_path",
+                                    target = 'metabolite')  %>%
+                      mutate(p.value = ifelse(p.value == 0, 100, p.value )) %>%
+                      mutate(p.value = ifelse(p.value == 100, min(p.value) /10, p.value)) %>%
+                      mutate(logp = -log(p.value) * sign(estimate)) %>%
+                      mutate(jaccard = 0) %>%
+                      dplyr::rename(rho = estimate) %>%
+                      dplyr::select(source, target, logp, rho, jaccard) %>%
+                      mutate(target = gsub(" $", "", target))
+
+gs_annot_metab <- ledge_matr_breadth$ledge_annot %>%
+                     mutate(BIOCHEMICAL = gsub("[(].*", "", BIOCHEMICAL)) %>%
+                    mutate(BIOCHEMICAL = gsub(" $", "", BIOCHEMICAL)) %>%
+                    filter(BIOCHEMICAL %in% meta_tran_int_filt$target) %>%
+                    dplyr::rename(source = "BIOCHEMICAL",
+                                  target = "pathways") %>%
+                    
+                    mutate(logp = 0,
+                           rho = 0, 
+                           jaccard = 0)
+       
+
+tr_gs_network <- read_tsv("../../RNA_Seq/output/data/network_table_transc_jaccard.txt") %>%
+                    mutate(combo2 = paste(target, source, sep = "__")) %>%
+                    mutate(select_combo = ifelse(combo %in% trans_corr_immune$combo,
+                                                 combo, combo2)) %>%
+                    filter(select_combo %in% trans_corr_immune$combo) %>%
+                    dplyr::select(-combo, -combo2) %>%
+                    dplyr::rename(combo = "select_combo") %>%
+                    right_join(., trans_corr_immune %>% dplyr::select(combo, logp, estimate ), 
+                              by = c('combo')) %>%
+                     mutate(logp = ifelse(is.infinite(logp), 
+                                         0, logp)) %>%
+                    mutate(logp = ifelse(logp == 0, 
+                                         max(abs(logp) * sign(estimate)), logp)) %>%
+                    filter(combo %in% trans_corr_immune$combo ) %>%
+                    mutate(jaccard = ifelse(is.na(jaccard), 0, jaccard)) %>%
+                    dplyr::select(-source, -target) %>%
+                    dplyr::rename(rho = "estimate") %>%
+                    separate(combo, into = c('source', 'target'), sep = "__", remove = F) %>%
+                    dplyr::select(source, target, logp, rho, jaccard) %>%
+                    bind_rows(meta_tran_int_filt) %>%
+                    bind_rows(gs_annot_metab) 
+                    
+
+
+
+write.table(tr_gs_network, "output/data/tr_metab_network_table.txt" ,sep = "\t", quote = F,
+            row.names = F)
+
+
+metabolite_nodes <- metabolon_DEM_mod$Cumulative_Breadth_dichot %>%
+                      ungroup() %>%
+                       mutate(BIOCHEMICAL = gsub("[(].*", "", BIOCHEMICAL)) %>%
+                        mutate(BIOCHEMICAL = gsub(" $", "", BIOCHEMICAL)) %>%
+                      filter(BIOCHEMICAL %in% meta_tran_int_filt$target) %>%
+                      mutate(logp = -log(p.value) *sign(effect_size)) %>%
+                      mutate(node_type = "metabolite") %>%
+                      dplyr::select(BIOCHEMICAL, node_type, logp) %>%
+                      dplyr::rename(node = "BIOCHEMICAL") #%>%
+                      
+write.table(metabolite_nodes, "output/data/metab_nodetable.txt" ,sep = "\t", quote = F, row.names = F)
+# tr_gs_node <- read.csv("../../RNA_Seq/output/data/transcriptomic_selected_node_table.csv") %>%
+tr_gs_node <- read_tsv("../../RNA_Seq/output/data/node_table_transc_jaccard.txt") %>%
+                #dplyr::select(-X) %>%
+                filter(node %in% meta_tran_int_filt$source) %>%
+                mutate(node_type = paste(node_type, "_transc", sep = "")) %>%
+                dplyr::select(-gsSize) %>%
+                bind_rows(enMap_breadth_prep_upd %>% 
+                            filter(pathway %in% gs_annot_metab$target) %>%
+                            dplyr::rename(node = 'pathway') %>%
+                            mutate(node_type = "metab_set") %>%
+                            dplyr::select(node, node_type, logp)) %>%
+                bind_rows(metabolite_nodes)
+       
+
+# node_table_metab <- fgsea_analysis_metabolon_no_lab$Cumulative_Breadth_dichot$metabolism$output %>%
+# node_table_metab <- enMap_breadth_prep_upd %>%
+#                     dplyr::select(-leadingEdge) %>%
+#                     #mutate(pathway = gsub("[(].*", "", pathway)) %>%
+#                     filter(pathway %in% meta_tran_int$pathways) %>%
+#                     rename(node = "pathway") %>%
+#                     mutate(sign = sign(NES)) %>%
+#                     dplyr::select(node, logp) %>%
+#                     mutate(node_type = "metab_pathway") %>%
+#                     dplyr::select(node, node_type, logp) %>%
+#                     bind_rows(tr_gs_node)
+# 
+# 
+# node_table_final <- metabolon_DEM$Cumulative_Breadth_dichot  %>%
+#                     ungroup() %>%
+#                     mutate(BIOCHEMICAL = gsub("[(].*", "", BIOCHEMICAL)) %>%
+#                     mutate(node_type = "metabolite") %>%
+#                     mutate(logp = -log(p.value) * sign(effect_size)) %>%
+#                     filter(BIOCHEMICAL %in% meta_tran_int$metabolite) %>%
+#                     dplyr::rename(node = "BIOCHEMICAL") %>%
+#                     dplyr::select(node, node_type, logp) %>%
+#                     bind_rows(node_table_metab)
+#                     
+
+write.table(tr_gs_node, "output/data/tr_metab_nodetable_final.txt" ,sep = "\t", quote = F, row.names = F)
+
+
+
+
+```
+
+```{r circos_prep}
+#transc_gene_mat <- read_tsv("../../RNA_Seq/output/data/batch_corrected_rlog_gene_matrix.txt")
+gsva_metabolon <- do.call("rbind", lapply(enMap_breadth_prep_upd$pathway, function(x){
+#gsva_metabolon <- lapply(enMap_breadth_prep_upd$pathway, function(x){        
+                   df <- enMap_breadth_prep_upd %>%
+                            filter(pathway == x) %>%
+                            separate_rows(leadingEdge, sep = "; ")  %>%
+                            separate_rows(leadingEdge, sep = "! ")
+                   ledge <- df$leadingEdge
+                   mat <- inputDF %>%
+                            filter(PID %in% transcrip_gsva$PID) %>%
+                            filter(CHEMICAL_ID %in% ledge) %>%
+                            dplyr::select(PID, CHEMICAL_ID, value) %>%
+                            unique() %>%
+                            spread(PID, value ) %>%
+                            column_to_rownames("CHEMICAL_ID") %>%
+                            as.matrix()
+
+                   gs <- GeneSetCollection(GeneSet(geneIds= ledge, 
+                            setName = x, 
+                            shortDescription = x))
+                  
+                   gsva <- gsva(expr = mat, gset.idx.list = gs, method = "zscore") %>%
+                            as.data.frame() %>%
+                            rownames_to_column("pathway") %>%
+                            mutate(pathway = gsub("SMPDB_|METABOLON_|[(].*", "", pathway)) %>%
+                            gather(PID, metab_zscore, -pathway) 
+                   return(gsva)
+      })) %>%
+      spread(pathway, metab_zscore)
+
+
+write.table(gsva_metabolon, file = "output/data/gsva_metabolon_signif.txt", sep = "\t", quote = F, row.names = F )
+
+firstup <- function(x) {
+  substr(x, 1, 1) <- toupper(substr(x, 1, 1))
+  x
+}
+
+test <- do.call("rbind", lapply(enMap_breadth_prep_upd$pathway, function(x){
+  ledge_metab <- enMap_breadth_prep_upd %>%
+          filter(pathway == x) %>%
+          separate_rows(leadingEdge, sep = "; ") %>%
+          separate_rows(leadingEdge, sep = "! ") %>%
+          .$leadingEdge
+  df_metab <- inputDF %>%
+              filter(CHEMICAL_ID %in% ledge_metab) %>%
+              dplyr::select(PID, CHEMICAL_ID, value) %>%
+              unique() %>%
+              dplyr::rename(metabolite = "CHEMICAL_ID",
+                            metabolite_value = "value") %>%
+              inner_join(., tr_matr_gsva, by = "PID") %>%
+              gather(transc_pathway, trans_zscore, -PID, -metabolite, -metabolite_value) %>%
+              group_by(metabolite, transc_pathway) %>%
+              do(model = cor.test(.$metabolite_value , .$trans_zscore, method  = "spearman")) %>%
+              ungroup() %>%
+              mutate(modelCoef = map(model, tidy)) %>%
+              unnest(modelCoef) %>%
+              mutate(signif = ifelse(p.value<0.05, 1, 0)) %>%
+              mutate(n_metab = n_distinct(metabolite)) %>%
+              group_by(transc_pathway) %>%
+              mutate(sum_signif = sum(signif == 1)) %>%
+              filter(sum_signif > 0) %>%
+              mutate(ratio_signif = sum_signif/ n_metab) %>%
+              mutate(log_signif = log(sum_signif)) %>%
+              filter(p.value < 0.05) %>%
+              # 
+              # mutate(maxp  = max(p.value)) %>%
+              #  mutate(logp = -log10(maxp) * sign(median(estimate))) %>%
+              # #dplyr::select()  
+              # ungroup() %>%
+              mutate(metab_pathway = x) #%>%
+              # dplyr::select(metab_pathway, transc_pathway, sum_signif,
+              #               ratio_signif, logp, maxp,log_signif  ) %>%
+              # unique()
+              
+          
+})) #%>%
+  # mutate(metab_pathway = gsub("METABOLON_", "", metab_pathway)) %>%
+  # mutate(metab_pathway = firstup(tolower(metab_pathway))) %>%
+  # mutate(metab_pathway = gsub("Tca_", "TCA_", metab_pathway)) %>%
+  # mutate(metab_pathway = gsub("Phosphatidylcholine_phosphatidylethanolamine", "PC:PE",
+  #                             metab_pathway)) %>%
+  #  mutate(metab_pathway = gsub("_", " ", metab_pathway))
+
+
+metab_links <- do.call("rbind", lapply(enMap_breadth_prep_upd$pathway, function(x){
+  ledge_metab <- enMap_breadth_prep_upd %>%
+          filter(pathway == x) %>%
+          separate_rows(leadingEdge, sep = "; ") %>%
+          separate_rows(leadingEdge, sep = "! ") %>%
+          .$leadingEdge
+  df_metab <- inputDF %>%
+              filter(CHEMICAL_ID %in% ledge_metab) %>%
+              dplyr::select(PID, CHEMICAL_ID, value) %>%
+              unique() %>%
+              dplyr::rename(metabolite = "CHEMICAL_ID",
+                            metabolite_value = "value") %>%
+              inner_join(., tr_matr_gsva, by = "PID") %>%
+              gather(transc_pathway, trans_zscore, -PID, -metabolite, -metabolite_value) %>%
+              group_by(metabolite, transc_pathway) %>%
+              do(model = cor.test(.$metabolite_value , .$trans_zscore, method  = "spearman")) %>%
+              tidy(., model) %>%
+              ungroup() %>%
+              mutate(signif = ifelse(p.value<0.05, 1, 0)) %>%
+              mutate(n_metab = n_distinct(metabolite)) %>%
+              group_by(transc_pathway) %>%
+              mutate(sum_signif = sum(signif == 1)) %>%
+              filter(sum_signif > 0) %>%
+              mutate(ratio_signif = sum_signif/ n_metab) %>%
+              mutate(log_signif = log(sum_signif)) %>%
+              filter(p.value < 0.05) %>%
+              
+              mutate(maxp  = max(p.value)) %>%
+               mutate(logp = -log10(maxp) * sign(median(estimate))) %>%
+              #dplyr::select()  
+              ungroup() %>%
+              mutate(metab_pathway = x) %>%
+              dplyr::select(metab_pathway, transc_pathway, sum_signif,
+                            ratio_signif, logp, maxp,log_signif  ) %>%
+              unique()
+              
+          
+})) %>%
+  mutate(metab_pathway = gsub("METABOLON_", "", metab_pathway)) %>%
+  mutate(metab_pathway = firstup(tolower(metab_pathway))) %>%
+  mutate(metab_pathway = gsub("Tca_", "TCA_", metab_pathway)) %>%
+  mutate(metab_pathway = gsub("Phosphatidylcholine_phosphatidylethanolamine", "PC:PE",
+                              metab_pathway)) %>%
+   mutate(metab_pathway = gsub("_", " ", metab_pathway)) 
+
+
+metab_link_color <- colorAssign(metab_links$logp, plot.scale = T)
+link_colors <- unlist(lapply(metab_links$logp, function(x){
+
+  col_ind <- which.min(abs(metab_link_color$scale - x)) 
+  return(names(metab_link_color$scale[col_ind]))
+  
+}))
+
+metab_links$color <- link_colors
+
+
+trans_integration <- trans_node_raw %>%
+                    mutate(p = exp(logp)) %>%
+                    mutate(logp = log10(p)) %>%
+                    mutate(omic = "transcriptomics") %>%
+                    mutate(n_ledge = log(gsSize)) %>%
+                    dplyr::select(node, logp, omic, n_ledge) %>%
+                    unique() %>%
+                    filter(node %in% metab_links$transc_pathway) %>%
+                    dplyr::rename(sector = "node")
+
+library(RColorBrewer)
+omic_colors <- brewer.pal(8,"Set1")[c(3:4)]
+names(omic_colors ) <- levels(as.factor(metab_integration$omic))
+
+metab_integration <- enMap_breadth_prep_upd %>%
+                    mutate(p = exp(logp)) %>%
+                    mutate(logp = log10(p)) %>%
+                    mutate(omic = "metabolomics") %>%
+                    separate_rows(leadingEdge, sep = "! ") %>%
+                    separate_rows(leadingEdge, sep = "; ") %>%
+                    mutate(pathway = gsub("METABOLON_", "", pathway)) %>%
+                    mutate(pathway = firstup(tolower(pathway))) %>%
+                    mutate(pathway = gsub("Tca_", "TCA_", pathway)) %>%
+                    mutate(pathway = gsub("Phosphatidylcholine_phosphatidylethanolamine", 
+                                          "PC:PE",pathway)) %>%
+                    mutate(pathway = gsub("_", " ",pathway)) %>%
+                    filter(pathway %in% metab_links$metab_pathway) %>%
+                    group_by(pathway ) %>%
+                    mutate(n_ledge = log(n_distinct(leadingEdge))) %>%
+                    ungroup() %>%
+                    dplyr::select(pathway, logp, omic, n_ledge) %>%
+                    unique() %>%
+                    filter(pathway%in% metab_links$metab_pathway) %>%
+                    dplyr::rename(sector = "pathway") %>%
+                    bind_rows(trans_integration) %>%
+                    mutate(direction = ifelse(logp > 0, "UP", "DN")) %>%
+                    arrange(desc(direction), omic, desc(abs(logp))) %>%
+                    inner_join(., data.frame(omic_colors) %>%
+                                    rownames_to_column("omic"), by = "omic" )
+
+metab_integration_color <- colorAssign(metab_integration$logp, plot.scale = T)
+sector_colors <- unlist(lapply(metab_integration$logp, function(x){
+
+  col_ind <- which.min(abs(metab_integration_color$scale - x)) 
+  return(names(metab_integration_color$scale[col_ind]))
+  
+}))
+
+metab_integration$color <- sector_colors
+
+
+# 
+# test <- lapply(trans_node_raw$node[1], function(x){
+#     LE <- trans_node_raw %>%
+#             filter(node  == x) %>%
+#             separate_rows(leadingEdge, sep = "; ") %>%
+#             .$leadingEdge
+#     mat
+# })
+
+
+
+tiff(filename = "output/figures/circos_sector_colorscale.tiff")
+metab_integration_color$plot_scale
+dev.off()
+
+tiff(filename = "output/figures/circos_links_colorscale.tiff")
+metab_link_color$plot_scale
+dev.off()
+```
+
+
+```{r circos_tr_metab_integrate}
+
+ 
+
+pdf("output/figures/circos_plot_metab_trans_integration.pdf", width = 9)
+
+circos.par("track.height" = 0.1, "gap.degree" = 1, 
+           circle.margin = c(1,1,3,1),
+           cell.padding = c(0.02, 0, 0.02, 0))
+circos.initialize(metab_integration$sector, xlim = c(min(metab_integration$n_ledge),
+                                                     max(metab_integration$n_ledge)),
+                  sector.width = metab_integration$n_ledge)
+
+circos.track(metab_integration$sector, bg.col = metab_integration$color, ylim = c(0,1),
+             panel.fun = function(x, y) {
+               circos.text(CELL_META$xcenter, 
+                           CELL_META$cell.ylim[2] + mm_y(5), 
+                           CELL_META$sector.index,
+                           facing = "bending.outside",
+                           niceFacing = T ,
+                           cex = 0.4,
+                           #adj = c(degree(0.05), degree(0)))
+                            adj = c(0.05, 0))
+})
+
+
+annot_metab_links <- do.call("rbind", lapply(unique(metab_links$metab_pathway), function(x){
+  
+  
+  df <- metab_links[metab_links$metab_pathway == x,] 
+  df_int <- metab_integration %>%
+              filter(sector %in% df$transc_pathway)
+  df <- df %>% arrange(match(transc_pathway, df_int$sect), transc_pathway)
+          
+  bounds <- get.cell.meta.data("xlim", sector.index = x)
+  
+  
+  
+  sum_ratios <- sum(df$ratio_signif)
+  ratio_pct <- df$ratio_signif / sum_ratios
+  width <- ratio_pct * (bounds[["max.data"]] - bounds[["min.data"]])
+  
+  #return(bounds[["max.data"]])
+  coords <- cumsum(width) + bounds[["min.data"]]
+  df$min_pos <- coords - width
+  df$max_pos <- coords
+  return(df)
+}))
+
+circos.track(metab_integration$sector, ylim = c(0,1),
+             bg.col = as.character(metab_integration$omic_colors ))
+
+lapply(seq(1:dim(metab_links)[1]), function(x){
+  df <- metab_links[x,]
+  m_path_df <- metab_integration[metab_integration$sector == df$metab_pathway,]
+  annot_df <- annot_metab_links[x,]
+  
+  # mid <- get.cell.meta.data("xcenter", sector.index = df$metab_pathway)
+  # buff <- (df$ratio_signif/m_path_df$n_ledge)/2
+  # t_path_df <- metab_integration[metab_integration$sector == df$transc_pathway,]
+  mid_t <- get.cell.meta.data("xcenter", sector.index = df$transc_pathway)
+  
+  circos.link(sector.index1 = df$metab_pathway, c(annot_df$min_pos, annot_df$max_pos),
+              sector.index2 = df$transc_pathway, mid_t, col = df$color )
+  
+  
+})
+
+
+#circos.link("MYB",5 ,"IRF8",c(2.5,10 ))
+
+dev.off()
+
+```
+
+
+
+```{r filt_circos_prep}
+
+
+
+metab_links_filt <- metab_links %>%
+                    filter(metab_pathway %in%
+                             c("PC:PE metabolism",
+                               "Bile acid metabolism" ) ) %>%
+                    filter(transc_pathway %in% c("Chemotaxis", "IL10 signaling" ,
+                                                 "IL1R signaling","Lipid catabolism",
+                                                 "NFKB", "NFKB #2", 
+                                                 "Phosphatidylcholine metabolism","SMAD1",
+                                                 "SMAD2 SMAD3", "SMAD4", "TNFA signaling #1" ,
+                                                 "TNFA signaling #2", "TNFA signaling #3", 
+                                                 "Humoral response", "Type I IFN #1",
+                                                 "Type I IFN #2")) %>%
+                    mutate(combo = paste(metab_pathway, transc_pathway, sep = "__"))
+
+metab_link_color_filt <- colorAssign(metab_links_filt$logp, plot.scale = T, alpha = 0.5)
+link_colors_filt <- unlist(lapply(metab_links_filt$logp, function(x){
+
+  col_ind <- which.min(abs(metab_link_color_filt$scale - x)) 
+  return(names(metab_link_color_filt$scale[col_ind]))
+  
+}))
+
+metab_links_filt$color <- link_colors_filt
+
+
+
+metab_integration_filt <- metab_integration %>%
+                          filter(sector %in% c(metab_links_filt$metab_pathway,
+                                               metab_links_filt$transc_pathway)) %>%
+                          mutate(n_sectors_area = n() * 10) %>%
+                          mutate(width_select = ifelse(sector %in% c("PC:PE metabolism", "Bile acid metabolism" ), n_sectors_area / 4, NA)) %>%
+                          mutate(non_select = ifelse(!sector %in% c("PC:PE metabolism", "Bile acid metabolism" ), 1, NA)) %>%
+                          #mutate(sum_remaining = sum(width_select, na.rm = T))
+                          mutate(width = ifelse(is.na(width_select), (n_sectors_area - sum(width_select, na.rm = T))/sum(non_select, na.rm = T), width_select)) %>%
+                          mutate(logrank = ifelse(omic == "metabolomics", logp + (10*sign(logp)),logp)) %>%
+                          group_by(sign(logp)) %>%
+                          mutate(rank_dir = sign(logrank) * rank(desc(logrank))) %>%
+                          ungroup() %>%
+                          arrange(rank_dir)
+
+
+
+order_sector_links <- function(sector_df, link_df, sector_width_col = "width", link_width_col = "link_width", pct.link_buffer = 0.30){
+  sector_df_raw <- sector_df %>%
+                    dplyr::select(sector, c(sector_width_col) ) %>%
+                    dplyr::rename(sec_width =  2) %>%
+                    mutate(rank = row_number()) %>%
+                    mutate(link_width = max(sec_width)  / (n() - 1))
+  
+
+  link_order <- sapply(sector_df_raw$sector, simplify = F, USE.NAMES = T, function(x){
+      center_df <- sector_df_raw %>%
+                  filter(sector == x)
+      max_rank = dim(sector_df_raw)[1] 
+      mid_value <- floor((max_rank)/2)
+      #return(mid_value)
+      
+      order_df <- sector_df_raw %>%
+                  filter(sector != x) %>%
+                  mutate(rank_adjusted = rank - (center_df$rank - mid_value) ) %>%
+                  mutate(rank_adjusted = ifelse(rank_adjusted > max_rank, rank_adjusted - max_rank, rank_adjusted)) %>%
+                  mutate(delta_mid = rank_adjusted - mid_value) %>%
+                  mutate(rank_final = -log(abs(delta_mid)/100) *sign(delta_mid)) %>%
+                  arrange(rank_final) %>%
+                  .$sector
+      link_connections <- link_df %>%  dplyr::rename(point1 = 1, point2 = 2) %>%
+                            filter(point1 == x | point2 == x)
+      links <- c(link_connections$point1, link_connections$point2)
+      links <- links[links != x]
+      int <- intersect(order_df, links)
+      return(int)
+  })
+
+  out <- do.call("rbind", lapply(seq(1, dim(link_df)[1]), function(x){
+  #out <-  lapply(seq(1, dim(link_df)[1]), function(x){
+    point_names <- colnames(link_df)[c(1:2)]
+    link_df_filt <- link_df[x,] %>% dplyr::rename(point1 = 1, point2 = 2)
+    total_sectors <- dim(sector_df_raw)[1] -1 
+    
+    point1_width_total <- link_df %>% 
+                      dplyr::rename(point1 = 1, point2 = 2) %>%
+                      filter(point1 == link_df_filt$point1 | point1 == link_df_filt$point2) %>%
+                      mutate(n = n()) %>%
+                      .$n %>% unique()
+   
+    point2_width_total <- link_df %>% 
+                      dplyr::rename(point1 = 1, point2 = 2) %>%
+                      filter(point2 == link_df_filt$point1 | point2 == link_df_filt$point2) %>%
+                      mutate(n = n()) %>%
+                      .$n %>% unique()
+
+    ind1 <- which(link_order[[link_df_filt$point1]] == link_df_filt$point2)
+    #return(ind2)
+    missing_point1 <- total_sectors - length(link_order[[link_df_filt$point1]])
+    ind2 <- which(link_order[[link_df_filt$point2]] == link_df_filt$point1) 
+    missing_point2 <- total_sectors - length(link_order[[link_df_filt$point2]])
+    #return(missing_point2)
+    sector1_link_width_raw <- sector_df_raw[sector_df$sector == link_df_filt$point1,]$link_width
+    sector1_buffer <- sector1_link_width_raw * ( pct.link_buffer)
+    
+    sector1_link_width <- sector1_link_width_raw - sector1_buffer
+    point1_start <- (sector1_link_width + sector1_buffer) * ((missing_point1/2) + ind1)
+    #return(point1_start)
+    point1_end <-  point1_start +  sector1_link_width
+    
+    sector2_link_width_raw <- sector_df_raw[sector_df$sector == link_df_filt$point2,]$link_width
+    #return(c(sector2_link_width_raw,ind2))
+    sector2_buffer <- sector2_link_width_raw * ( pct.link_buffer)
+    sector2_link_width <- sector2_link_width_raw - sector2_buffer
+    point2_start <- (sector2_link_width +sector2_buffer )* ((missing_point2/2) +ind2)
+    point2_end <-  point2_start +  sector2_link_width
+    
+    point1_width <- 
+    #return(point2_start)
+     
+    out_df <- link_df_filt %>% bind_cols(data.frame("point1_start" = point1_start, "point1_end" = point1_end,
+                                                    "point2_start" = point2_start, "point2_end" = point2_end,
+                                                    "point1_width" = sector_df_raw[sector_df$sector == link_df_filt$point1,]$sec_width / point1_width_total,
+                                                    "point2_width" = sector_df_raw[sector_df$sector == link_df_filt$point2,]$sec_width / point2_width_total))          
+    colnames(out_df)[c(1:2)] <- point_names
+    return(out_df)
+  #})
+  }))
+  
+}
+
+metab_links_filt <- order_sector_links(metab_integration_filt, link_df = metab_links_filt)          
+
+metab_integration_color_filt <- colorAssign(metab_integration_filt$logp, plot.scale = T)
+sector_colors_filt <- unlist(lapply(metab_integration_filt$logp, function(x){
+
+  col_ind <- which.min(abs(metab_integration_color_filt$scale - x)) 
+  return(names(metab_integration_color_filt$scale[col_ind]))
+  
+}))
+
+metab_integration_filt$color <- sector_colors_filt
+
+tiff(filename = "output/figures/circos_sector_colorscale_filt.tiff")
+metab_integration_color_filt$plot_scale
+dev.off()
+
+tiff(filename = "output/figures/circos_links_colorscale_filt.tiff")
+metab_link_color_filt$plot_scale
+dev.off()
+
+
+
+```
+
+
+```{r circos_tr_metab_integrate_filt}
+
+ 
+
+pdf("output/figures/circos_plot_metab_trans_integration_filtered.pdf", width = 9)
+
+circos.par("track.height" = 0.1, "gap.degree" = 1, 
+           circle.margin = c(1,1,3,1),
+           cell.padding = c(0.02, 0, 0.02, 0))
+circos.initialize(metab_integration_filt$sector, xlim = c(min(metab_integration_filt$width),max(metab_integration_filt$width)),
+                  sector.width = metab_integration_filt$width)
+
+circos.track(metab_integration_filt$sector, bg.col = metab_integration_filt$color, ylim = c(0,1),
+             panel.fun = function(x, y) {
+               circos.text(CELL_META$xcenter, 
+                           CELL_META$cell.ylim[1] + mm_y(5), 
+                           CELL_META$sector.index,
+                           facing = "clockwise",
+                           niceFacing = T ,
+                           cex = 0.4,
+                           adj = c(0.05, degree(0)))
+                          
+})
+
+circos.track(metab_integration_filt$sector, ylim = c(0,1),
+             bg.col = as.character(metab_integration_filt$omic_colors ))
+
+
+lapply(seq(1:dim(metab_links_filt)[1]), function(x){
+  df <- metab_links_filt[x,]
+  m_path_df <- metab_integration_filt[metab_integration_filt$sector == df$metab_pathway,]
+
+
+  circos.link(sector.index1 = df$metab_pathway,
+              point1= c(df$point1_start, df$point1_end),
+              sector.index2 = df$transc_pathway, point2 = c(df$point2_start, df$point2_end), col = df$color, lty = 1, lwd = 0.1 )
+
+
+})
+
+# chords_df <- metab_links_filt[,c("metab_pathway", "transc_pathway", "point1_width", "point2_width")]
+# 
+# chordDiagram(x = chords_df)
+
+
+dev.off()
+
+```
+
+
+```{r integrate metab_w_IFN}
+
+metabolon_select_IFN <- enMap_breadth_prep_upd %>%
+                      top_n(n = 2, wt = abs(logp)) %>%
+                      .$pathway
+
+meta_tran_int_IFN <- as.data.frame(t(ledge_matr_breadth$ledge_matrix)) %>%
+                  rownames_to_column('PID') %>%
+                  filter(PID %in% transcrip_gsva$PID) %>%
+                  inner_join(., transcrip_gsva, by ="PID") %>%
+                  gather(transc_path, tr_zscore, colnames(transcrip_gsva)[2:length(colnames(transcrip_gsva))]) %>%
+                  gather(metabolite, metab_zscore, row.names(ledge_matr_breadth$ledge_matrix)) %>%
+                  filter(grepl("Type I IFN", transc_path)) %>%
+                  group_by(transc_path, metabolite) %>%
+                  do(model = cor.test(.$tr_zscore, .$metab_zscore, method = "spearman")) %>%
+                  tidy(., model) %>%
+                  filter(p.value < 0.1) %>%
+                  ungroup() %>%
+                  mutate(metabolite = gsub("_", " ", metabolite)) %>%
+                  mutate(transc_path = gsub("[.]", " ", transc_path)) %>%
+                  inner_join(., ledge_matr_breadth$ledge_annot, 
+                             by = c('metabolite' = 'BIOCHEMICAL')) %>%
+                  mutate(metabolite = gsub("[(].*", "", metabolite))
+                  
+
+
+trans_node__immune_raw_IFN <- trans_node_raw %>%
+              mutate(dir = sign(logp)) %>%
+              mutate(logp = ifelse(!node %in% meta_tran_int_IFN$transc_path, 0, logp)) %>%
+              #arrange(desc(abs(logp))) %>%
+              group_by(dir, node_type) %>%
+              
+              mutate(rank = rank(desc(abs(logp)))) %>%
+              arrange(node_type, dir, rank) %>%
+              ungroup() %>%
+              mutate(select = ifelse( rank <= 10, 1, 2 )) %>% 
+              mutate(select = ifelse(node_type == 'metab', 3, select )) #%>%
+              # mutate(select = ifelse(!node %in% meta_tran_int$transc_path & select == 1,
+              #                        2, select ))
+
+select_immune_IFN <- trans_node__immune_raw_IFN[trans_node__immune_raw_IFN$node %in%
+                                                  meta_tran_int_IFN$transc_path,]$node
+            
+#identify metabolites correlated to immune pathwways
+select_metabolites_IFN <- meta_tran_int_IFN %>%
+                      filter(metabolite %in%
+              unique(meta_tran_int_IFN[meta_tran_int_IFN$transc_path %in%
+                                     select_immune_IFN,]$metabolite)) %>%
+                dplyr::select(metabolite) %>%
+                unique() %>% .$metabolite
+
+# test <-  meta_tran_int %>%
+#           #group_by(transc_path) %>%
+#           group_by(pathways) %>%
+#           mutate(minp = min(p.value)) %>%
+#           ungroup() %>%
+#           dplyr::select(pathways, minp) %>%
+#           #dplyr::select(transc_path, minp) %>%
+#           unique() %>%
+#           arrange(desc(minp)) %>%
+#           mutate(rank = rank(minp))
+#           mutate(n_path = n_distinct(pathways),
+#                  path_coll = paste(pathways, collapse = '; ')) %>%
+#           ungroup() %>%
+#           dplyr::select(-pathways) %>%
+#           unique()
+
+
+
+trans_corr_raw_IFN <- tr_matr_gsva %>%
+                rownames_to_column("PID") %>%
+                gather(pathway1, value1, -PID) %>%
+                inner_join(., tr_matr_gsva %>% rownames_to_column("PID"), by = "PID") %>%
+                gather(pathway2, value2, -PID, -pathway1, -value1) %>%
+                # filter(grepl(paste(paste(trans_node__immune_raw$node,collapse = "|") ,
+                #                    paste(trans_node_raw[trans_node_raw$node_type == "metab",]$node,
+                #                    collapse = "|"), sep  = "|"), pathway1 )) 
+                mutate(combo = paste(pathway1, pathway2, sep = "__")) %>%
+                filter(combo %in% combo_trans) %>%
+                group_by(combo) %>%
+                do(model = cor.test(.$value1, .$value2, method = "spearman")) %>%
+                tidy(., model) %>%
+                ungroup() %>%
+                filter(p.value < 0.01) %>%
+                #filter(grepl(paste(test$node, collapse = "|"), combo))
+                separate(combo, into = c("source","target"), sep = "__", remove = F) %>%
+                filter(combo %in% combo_trans)
+
+
+metab_filter_out_IFN <- trans_node__immune_raw_IFN %>%
+                        filter(select == 3) %>%
+                        filter(!grepl(paste(c('ATF4', "Lipid cat", 'NAD met', "Phospha"), 
+                                           collapse = "|"), node)) %>%
+                        .$node %>%
+                        paste(., collapse = "|")
+
+immune_remove <- trans_node__immune_raw_IFN %>%
+                    filter(select == 1) %>%
+                    filter(!grepl("Type I IFN", node)) %>%
+                    .$node %>% paste(., collapse = "|")
+
+
+trans_corr_immune_IFN <- trans_corr_raw %>%
+              filter(!grepl(immune_remove, combo)) %>%
+              #filter(grepl(paste(select_immune_IFN,collapse = "|") , combo)) %>%
+              filter(!grepl(metab_filter_out, combo)) %>%
+              # filter(!grepl(paste(trans_node__immune_raw_IFN[trans_node__immune_raw_IFN$select ==
+              #                                                  2,]$node,
+              # collapse = "|"), combo)) %>%
+              mutate(logp = -log(p.value) * sign(estimate))
+              
+
+corr_trans_path_IFN <- paste(unique(union(trans_corr_immune_IFN$source,
+                                          trans_corr_immune_IFN$target)),
+                         collapse = "|")
+
+
+
+
+meta_tran_int_filt_IFN <- meta_tran_int_IFN %>%
+                      filter(grepl(corr_trans_path_IFN, transc_path)) %>%
+                      dplyr::rename(source = "transc_path",
+                                    target = 'metabolite')  %>%
+                      mutate(p.value = ifelse(p.value == 0, 100, p.value )) %>%
+                      mutate(p.value = ifelse(p.value == 100, min(p.value) /10, p.value)) %>%
+                      mutate(logp = -log(p.value) * sign(estimate)) %>%
+                      mutate(jaccard = 0) %>%
+                      dplyr::rename(rho = estimate) %>%
+                      dplyr::select(source, target, logp, rho, jaccard) %>%
+                      mutate(target = gsub(" $", "", target))
+
+gs_annot_metab_IFN <- ledge_matr_breadth$ledge_annot %>%
+                     mutate(BIOCHEMICAL = gsub("[(].*", "", BIOCHEMICAL)) %>%
+                    mutate(BIOCHEMICAL = gsub(" $", "", BIOCHEMICAL)) %>%
+                    filter(BIOCHEMICAL %in% meta_tran_int_filt_IFN$target) %>%
+                    dplyr::rename(source = "BIOCHEMICAL",
+                                  target = "pathways") %>%
+                    
+                    mutate(logp = 0,
+                           rho = 0, 
+                           jaccard = 0)
+       
+
+tr_gs_network_IFN <- read_tsv("../../RNA_Seq/output/data/network_table_transc_jaccard.txt") %>%
+                    mutate(combo2 = paste(target, source, sep = "__")) %>%
+                    mutate(select_combo = ifelse(combo %in% trans_corr_immune_IFN$combo,
+                                                 combo, combo2)) %>%
+                    filter(select_combo %in% trans_corr_immune_IFN$combo) %>%
+                    dplyr::select(-combo, -combo2) %>%
+                    dplyr::rename(combo = "select_combo") %>%
+                    right_join(., trans_corr_immune_IFN %>% dplyr::select(combo, logp, estimate ), 
+                              by = c('combo')) %>%
+                    filter(combo %in% trans_corr_immune_IFN$combo ) %>%
+                    mutate(jaccard = ifelse(is.na(jaccard), 0, jaccard)) %>%
+                    dplyr::select(-source, -target) %>%
+                    dplyr::rename(rho = "estimate") %>%
+                    separate(combo, into = c('source', 'target'), sep = "__", remove = F) %>%
+                    dplyr::select(source, target, logp, rho, jaccard) %>%
+                    bind_rows(meta_tran_int_filt_IFN) %>%
+                    bind_rows(gs_annot_metab_IFN) 
+                    
+
+
+
+write.table(tr_gs_network_IFN, "output/data/tr_metab_network_table_IFN.txt" ,sep = "\t", quote = F,
+            row.names = F)
+
+
+metabolite_nodes_IFN <- metabolon_DEM_mod$Cumulative_Breadth_dichot %>%
+                      ungroup() %>%
+                       mutate(BIOCHEMICAL = gsub("[(].*", "", BIOCHEMICAL)) %>%
+                        mutate(BIOCHEMICAL = gsub(" $", "", BIOCHEMICAL)) %>%
+                      filter(BIOCHEMICAL %in% meta_tran_int_filt_IFN$target) %>%
+                      mutate(logp = -log(p.value) *sign(effect_size)) %>%
+                      mutate(node_type = "metabolite") %>%
+                      dplyr::select(BIOCHEMICAL, node_type, logp) %>%
+                      dplyr::rename(node = "BIOCHEMICAL") #%>%
+                      
+write.table(metabolite_nodes_IFN, "output/data/metab_nodetable_IFN.txt" ,sep = "\t", quote = F, row.names = F)
+# tr_gs_node <- read.csv("../../RNA_Seq/output/data/transcriptomic_selected_node_table.csv") %>%
+tr_gs_node_IFN <- read_tsv("../../RNA_Seq/output/data/node_table_transc_jaccard.txt") %>%
+                #dplyr::select(-X) %>%
+                filter(node %in% meta_tran_int_filt_IFN$source) %>%
+                mutate(node_type = paste(node_type, "_transc", sep = "")) %>%
+                dplyr::select(-gsSize) %>%
+                bind_rows(enMap_breadth_prep_upd %>% 
+                            filter(pathway %in% gs_annot_metab_IFN$target) %>%
+                            dplyr::rename(node = 'pathway') %>%
+                            mutate(node_type = "metab_set") %>%
+                            dplyr::select(node, node_type, logp)) %>%
+                bind_rows(metabolite_nodes_IFN)
+       
+
+# node_table_metab <- fgsea_analysis_metabolon_no_lab$Cumulative_Breadth_dichot$metabolism$output %>%
+# node_table_metab <- enMap_breadth_prep_upd %>%
+#                     dplyr::select(-leadingEdge) %>%
+#                     #mutate(pathway = gsub("[(].*", "", pathway)) %>%
+#                     filter(pathway %in% meta_tran_int$pathways) %>%
+#                     rename(node = "pathway") %>%
+#                     mutate(sign = sign(NES)) %>%
+#                     dplyr::select(node, logp) %>%
+#                     mutate(node_type = "metab_pathway") %>%
+#                     dplyr::select(node, node_type, logp) %>%
+#                     bind_rows(tr_gs_node)
+# 
+# 
+# node_table_final <- metabolon_DEM$Cumulative_Breadth_dichot  %>%
+#                     ungroup() %>%
+#                     mutate(BIOCHEMICAL = gsub("[(].*", "", BIOCHEMICAL)) %>%
+#                     mutate(node_type = "metabolite") %>%
+#                     mutate(logp = -log(p.value) * sign(ef ect_size)) %>%
+#                     filter(BIOCHEMICAL %in% meta_tran_int$metabolite) %>%
+#                     dplyr::rename(node = "BIOCHEMICAL") %>%
+#                     dplyr::select(node, node_type, logp) %>%
+#                     bind_rows(node_table_metab)
+#                     
+
+write.table(tr_gs_node_IFN, "output/data/tr_metab_nodetable_final_IFN.txt" ,sep = "\t", quote = F, row.names = F)
+
+
+
+
+```
+
+
+
+```{r predictive_modelling_univariate}
+library(caret)
+ cap_metab <- read.csv("../../Caprion_proteomics_metab/Caprion_metabolomics/output/data/caprion_metabolites.csv") %>%
+                rename(feature = "metab") %>%
+                dplyr::select(PID, feature, value) %>%
+                unique() %>%
+                remove_rownames() %>%
+                mutate(feature = paste(feature, ":CAPRION", sep = ""))
+
+
+
+predict_prep <-  inputDF %>%
+                as.data.frame() %>%
+                dplyr::rename(feature = "BIOCHEMICAL") %>%
+                dplyr::select(PID, feature, value) %>%
+                mutate(feature = paste(feature, ":METABOLON", sep ="")) %>%
+                bind_rows(cap_metab) %>%
+                left_join(., outcome_merged, by = "PID") %>%
+                gather(outcome, outcome_value, one_of(colnames(outcome_merged)[c(5:9, 17)])) %>%
+                dplyr::select(PID, feature, value, outcome, outcome_value) %>%
+                spread(outcome, outcome_value) %>%
+                #rownames_to_column("PID") %>%
+                #gather(feature, value, -PID) %>%
+                #inner_join(., outcome_merged, by ="PID") %>%
+                mutate(caprion_clust_bin = as.character(caprion_clusters_ord))  %>%
+                mutate(caprion_clust_bin = ifelse(caprion_clust_bin %in% c("Intermediary", "Oligovalent", 
+                                                                              "Non-Responsive"), 
+                                                  "Oligovalent", caprion_clust_bin)) %>%
+                gather(outcome, outcome_value, one_of(c(colnames(outcome_merged)[c(5:9)], "caprion_clust_bin"))) %>%
+                filter(!is.na(outcome_value)) %>%
+                #dplyr::select(PID, feature, value, outcome, outcome_value) %>%
+                filter(!is.na(value)) %>%
+                unique()
+         
+
+
+
+kfolds <- 5                
+                
+train.control_bin <- trainControl(method = "cv", number = kfolds, summaryFunction = twoClassSummary, 
+                              classProbs = T, savePredictions = T)
+train.control_regr <- trainControl(method = "cv", number = kfolds)
+
+
+bin_Feat_cv <- function(df){
+  model <- train(outcome_value ~ value, data = df, trControl = train.control_bin, method = "glm", 
+                 preProc = c("center", "scale"))
+  return(model$results$ROC)
+}
+
+contin_Feat_cv <- function(df){
+  model <- train(outcome_value ~ value, data = df, trControl = train.control_regr, method = "lm")
+  return(model$results$Rsquared)
+}
+
+breadth_predict <- predict_prep %>%
+                    filter(outcome == "Cumulative_Breadth_dichot") %>%
+                    #filter(feature == "4F2_HUMAN" ) %>%
+                    group_by(feature) %>%
+                    nest() %>%
+                    mutate(Cumulative_Breadth_dichot_AUROC = map(data, bin_Feat_cv)[[1]]) %>%
+                    dplyr::select(-data) %>%
+                    ungroup()
+  
+
+unsup_predict <- predict_prep %>%
+                    filter(outcome == "caprion_clust_bin") %>%
+                    group_by(feature) %>%
+                    nest() %>%
+                    mutate(caprion_clust_bin_AUROC = map(data, bin_Feat_cv)[[1]]) %>%
+                    dplyr::select(-data) %>%
+                    ungroup()  
+
+
+serotype_magnitude_predict <- predict_prep %>%
+                    filter(grepl("AUC", outcome)) %>%
+                    mutate(outcome_value = as.numeric(outcome_value)) %>%
+                    group_by(feature, outcome) %>%
+                    nest() %>%
+                    mutate(Rsq = map(data, contin_Feat_cv)[[1]]) %>%
+                    dplyr::select(-data) %>%
+                    ungroup() %>%
+                    mutate(outcome = paste(outcome, "Rsq", sep = "_")) %>%
+                    spread(outcome, Rsq)
+  
+
+ combined_predic_univ <- left_join(breadth_predict, serotype_magnitude_predict, by ="feature") %>%
+                          left_join(., unsup_predict, by = "feature") %>%
+                          mutate(origin = str_extract_all(feature, "METABOLON|CAPRION")[[1]]) %>%
+                          dplyr::rename(feature_temp = "feature") %>%
+                          mutate(feature = gsub(":METAB.*|:CAPRION", "", feature_temp)) %>%
+                          dplyr::select(feature, origin, everything()) %>%
+                          dplyr::select(-feature_temp) %>%
+                          filter(!is.na(DV1_AUCp_log_Rsq))
+   
+
+writexl::write_xlsx(combined_predic_univ, path = "output/data/univariate_predictive_modeling_metabolites.xlsx")
+
+
+
+
+
+```
+
+```{r metab}
+
+```{r compil PID}
+
+compil_pid_metab <- inputDF %>%
+                    dplyr::select(PID) %>%
+                    unique() %>%
+                    mutate(omic = 'metabolome')
+
+write_tsv(compil_pid_metab,path = 'output/data/compil_PID.txt')
+
+
+```
+
+
+```{r metab_bCell}
+
+b_cell_df <- read_tsv("../../FACS/Baseline_experiment/Abdullah_baseline/output/b_cell_frequencies.tsv") %>%
+  mutate(louvain = paste("Cluster", louvain)) %>%
+  dplyr::select(louvain, DonorID, Freq) %>%
+  inner_join(., ledge_matr_breadth$ledge_matrix %>%
+               as.data.frame() %>%
+              rownames_to_column("metab") %>%
+               gather(PID, zscore, -metab), 
+             by = c("DonorID" = "PID")) %>%
+  spread(louvain, Freq) %>%
+  spread(metab, zscore) %>%
+  column_to_rownames("DonorID") %>%
+  as.matrix()
+
+
+test <- as.data.frame(rcorr(b_cell_df, type = "spearman")$P[c(1:2),]) %>%
+          rownames_to_column("cluster") %>%
+          gather(metab, p.value, -cluster) %>%
+          filter(p.value < 0.05)
+
+test2 <- rcorr(b_cell_df[,colnames(b_cell_df) %in% c(test$cluster,test$metab)], type = "spearman")
+
+cor.matrix2 <- test2
+cor.matrix2$r[cor.matrix2$P > 0.05] <- 0
+
+
+library(corrplot)
+pdf("output/figures/corrplot_metab_cl1_16_breadth_Bcells.pdf")
+corrplot(cor.matrix2$r, method="circle", type="lower", is.corr=TRUE,
+         col=colorRampPalette(c("blue","white","red"))(500), tl.col = "black")
+dev.off()
+
+```
+
+
+
+
+
+
+```{r make esets}
+
+metabolite_eset <- ExpressionSet(assayData = ledge_matr_breadth$ledge_matrix,
+                                 featureData = AnnotatedDataFrame(metabolon_DEM$Cumulative_Breadth_dichot %>%
+                                                                    ungroup() %>%
+                                                                    dplyr::filter(BIOCHEMICAL %in% row.names(ledge_matr_breadth$ledge_matrix)) %>%
+                                                                    arrange(match(BIOCHEMICAL, row.names(ledge_matr_breadth$ledge_matrix))) %>%
+                                                                    column_to_rownames("BIOCHEMICAL")) )
+
+
+saveRDS(metabolite_eset, file = "output/data/metabolite_eset.RDS")
+
+
+
+
+metab_mod_fData <- enMap_breadth_prep_upd %>%
+          mutate(pathway = gsub("METABOLON_", "", pathway)) %>%
+            arrange(match(pathway, colnames(gsva_metabolon)[c(2:7)])) %>%
+            separate_rows(leadingEdge, sep = "; ") %>%
+            separate_rows(leadingEdge, sep = "! ") %>%
+            inner_join(., inputDF %>% dplyr::select(BIOCHEMICAL, CHEMICAL_ID) %>% unique() , by = c("leadingEdge" = "CHEMICAL_ID")) %>%
+            dplyr::select(-leadingEdge) %>%
+            group_by(pathway) %>%
+            mutate(leadingEdge = paste(BIOCHEMICAL, collapse = "! ")) %>%
+            ungroup() %>%
+            dplyr::select(-BIOCHEMICAL) %>%
+            unique() %>%
+            column_to_rownames("pathway")
+
+
+metabolite_module_eset <- ExpressionSet(assayData = gsva_metabolon %>%
+                                                    gather(pathway, value, -PID) %>%
+                                                    spread(PID, value) %>% column_to_rownames("pathway") %>% as.matrix(),
+                                        featureData = AnnotatedDataFrame(metab_mod_fData))
+
+
+saveRDS(metabolite_module_eset, file = "output/data/metabolite_module_eset.RDS")
+
+
+
+
+```

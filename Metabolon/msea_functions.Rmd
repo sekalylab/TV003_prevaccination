@@ -1,0 +1,1028 @@
+---
+title: "analysis_functions"
+author: "Adam Pelletier"
+date: "10/27/2020"
+output: html_document
+---
+
+
+```{r colorAssign}
+
+colorAssign <- function(valueVector, scale_limits = NULL, colors = c("blue", "white", "red"), length.vector = 500, plot.scale = F, break_points = F, alpha = 1){
+  require(scales)
+  colorLS <- colorRampPalette(colors = colors)(length.vector)  
+  colorLS <- alpha(colorLS , alpha = alpha)
+  if(is.null(scale_limits)){
+    breaks <- seq(-max(abs(valueVector)), max(abs(valueVector)), length.out = length.vector)
+  } else {
+    breaks <- seq(scale_limits[1], scale_limits[2], length.out = length.vector)
+  }
+  
+  
+  minBreak <- which(abs(breaks - min(valueVector)) == min(abs(breaks - min(valueVector))))
+  maxBreak <- which(abs(breaks - max(valueVector)) == min(abs(breaks - max(valueVector))))
+  colorScale <- breaks[minBreak:maxBreak]
+  names(colorScale) <- colorLS[minBreak:maxBreak]
+  if(plot.scale == F){
+    
+    return(colorScale)
+  } else {
+    p <- pheatmap(as.matrix(rev(breaks[minBreak:maxBreak])), color = names(colorScale), cluster_rows = F, cluster_cols = F, cellwidth = 6, cell_height = 0.1, height = 4, width = 1)
+    return(list("scale" = colorScale, "plot_scale" = p ))
+  }
+  
+}
+
+
+
+```
+
+
+
+
+```{r expression_hm_DEM}
+  
+order_matrix_cols <- function(matrix, method = "pos_avg", stat_df, metric = "effect_size", direction = 1, featureID = "CHEMICAL_ID", select_features = NULL){
+
+  if(method == "pos_avg") {
+    select_id <- stat_df[stat_df[metric] > 0,][[featureID]]
+
+  } else if(method == "neg_avg"){
+    select_id <- stat_df[stat_df[metric] < 0,][[featureID]]
+  }
+  #return(select_id)
+  #matrix_filt <- matrix[select_id,]
+  #return(matrix)
+  if(!is.null(select_features)){
+    select_id <- intersect(select_id, select_features)
+  }
+  
+  if(length(select_id) > 1){
+    order_mat <- as.data.frame(matrix) %>%
+              rownames_to_column("feature") %>%
+              filter(feature %in% select_id) %>%
+              gather(PID, value, -feature) %>%
+              group_by(PID) %>%
+              summarise(mean_val = mean(value)) %>%
+              ungroup() %>%
+              mutate(rank = rank(mean_val)) %>%
+              arrange(rank) %>%
+              .$PID
+  } else {
+    order_mat <- names(sort(matrix[select_id,]))
+
+    
+  }
+  
+  matrix_out <- matrix[,order_mat]
+
+  return(matrix_out)
+}
+
+#test <- order_matrix_cols(ledge_matr_breadth$ledge_matrix, stat_df = metabolon_DEM$Cumulative_Breadth_dichot)
+
+expression_hm_metabolon <- function(inputDF, 
+                                    fData,
+                                    pData, 
+                                    tidy_stats, 
+                                    #samples_filt,
+                                    p_thr = 0.05,
+                                    padj_thr = 0.25,
+                                    hm.params = NULL,
+                                    filename,
+                                    width = NULL,
+                                    height = NULL,
+                                    contrast,
+                                    order_analyte = NA,
+                                    cell_width = 3,
+                                    rowClust = FALSE,
+                                    select_feature
+                                    ){
+  
+  samples_filt <- pData[!is.na(pData[[contrast]]) ,]$sample_ids
+
+  tidy_stats_filt<- tidy_stats[tidy_stats$p.value < p_thr,]
+  sig_analytes <- tidy_stats_filt[tidy_stats_filt$adjp < padj_thr,]$CHEMICAL_ID
+  metab_matrix <- inputDF %>%
+        dplyr::select(CHEMICAL_ID, BIOCHEMICAL, sample_ids,  value) %>%
+        dplyr::filter(!is.na(CHEMICAL_ID)) %>%
+        distinct(.) %>%
+        filter(sample_ids %in% samples_filt) %>%
+        group_by(BIOCHEMICAL) %>%
+        mutate(ntile = scale(ntile(value, n = 100))) %>%
+        ungroup() %>%
+        dplyr::select(-value) %>%
+        spread(sample_ids, ntile) %>%
+        dplyr::select(-BIOCHEMICAL) %>%
+        inner_join(.,tidy_stats, by =  "CHEMICAL_ID") %>%
+        mutate(slogp = -log2(p.value) * sign(effect_size)) %>%
+        mutate(SUB_PATHWAY_FILT = ifelse(SUPER_PATHWAY == "Lipid", SUB_PATHWAY, NA)) %>%
+        arrange(SUPER_PATHWAY, SUB_PATHWAY_FILT, slogp) %>%
+        dplyr::select(CHEMICAL_ID, samples_filt) %>%
+        # filter(complete.cases(.)) %>%
+        # dplyr::select(-contrast) %>%
+        filter(CHEMICAL_ID %in% sig_analytes) %>%
+        column_to_rownames("CHEMICAL_ID") %>%
+        as.matrix(.)
+  
+ 
+  # if(is.na(order_analyte)){
+  #   order <- pData %>%
+  #        dplyr::select(sample_ids, contrast) %>%
+  #       unique(.) %>%
+  #       filter(complete.cases(.))
+  #   order <- order[order(order[[2]]),]$sample_ids
+  # } else if(order_analyte == "effect_size") {
+  #   analyte <- tidy_stats_filt %>% arrange(p.value) %>% rowid_to_column("rowid") %>% filter(rowid == 1) %>% .$BIOCHEMICAL
+  #   order <- inputDF %>%
+  #             filter(BIOCHEMICAL == analyte) %>%
+  #             arrange(value) %>%
+  #             .$sample_ids
+  # } else {
+  #   order <- inputDF %>%
+  #             filter(BIOCHEMICAL == order_analyte) %>%
+  #             arrange(value) %>%
+  #             .$sample_ids
+  # }
+  
+
+  
+
+  #metab_matrix <- t(metab_matrix)
+ # #print(ledge_matrix[1])
+
+ 
+ #metab_matrix <- metab_matrix[match(order, row.names(metab_matrix)),]
+ #print(metab_matrix)
+ 
+  
+  #metab_matrix_scale <- t(scale(metab_matrix))
+  print(metab_matrix)
+  return(metab_matrix)
+  metab_matrix_scale <- order_matrix_cols(metab_matrix, stat_df = tidy_stats_filt)
+  #return(metab_matrix_scale)
+  colorLS <- colorAssign(metab_matrix_scale, colors = c("blue", "white", "red"))
+  # fdata_annot <- fData %>% filter(!is.na(CHEMICAL_ID)) %>% column_to_rownames("CHEMICAL_ID")
+  # pData_annot <- pData %>% column_to_rownames("sample_ids")
+  
+  
+  row_annot <- metab_matrix_scale %>%
+                as.data.frame(.) %>%
+                rownames_to_column("CHEMICAL_ID") %>%
+                inner_join(.,fData, by = "CHEMICAL_ID") 
+  
+  # gaps <- row_annot %>%
+  #               mutate(group_id = group_indices(.,SUPER_PATHWAY)) %>%
+  #               dplyr::select(CHEMICAL_ID,group_id) %>%
+  #               rowid_to_column(.) %>%
+  #               group_by(group_id) %>%
+  #               mutate(max = max(rowid)) %>%
+  #               ungroup(.) %>%
+  #               dplyr::select(-CHEMICAL_ID, -rowid) %>%
+  #               distinct(.) %>%
+  #               filter(group_id != max(group_id)) %>%
+  #               .$max
+  
+  hm.parameters <- list(
+    mat = metab_matrix_scale,
+    #main = paste("GSEA_",geneset, sep=""),
+    color = colorLS,
+    fontsize= 6,
+    # cellheight = 4,
+    # cellwidth = 8,
+    show_colnames = FALSE,
+    annotation_names_row = FALSE,
+
+    labels_row = row_annot[["BIOCHEMICAL"]],
+    #gaps_row = gaps,
+    cluster_rows = rowClust
+  
+    #filename = filename,
+    # width = width,
+    # height = height,
+    #legend = legend,
+   
+  )
+  
+  
+     
+
+  #hm.parameters <- c(hm.parameters,hm.params)
+  if(!is.null( hm.params)){
+      hm.parameters <- modifyList(hm.parameters, hm.params, keep.null = T)
+  }
+  p <- do.call("pheatmap", hm.parameters)
+
+  pdf(filename, height = height, width = width)
+  print(p)
+  dev.off()
+  return(p) 
+}
+
+
+
+
+```
+
+```{r barplot_msea}
+
+gsea_barplot_func <- function(gsea_df, title = NULL, column = "NES", ylabel = "NES (Normalized Enrichment Score)"){
+  df <- gsea_df 
+  topScale <- max(abs(df[[column]]))
+  colorLS <- colorRampPalette(colors = c("blue", "white", "red"))(500)
+
+  p <- ggplot(df, aes_string(x = paste0("reorder(pathway,",column, ")"), y = column, fill = column)) + 
+        geom_bar(stat='identity', width=0.8, position = "identity") +
+        theme_bw() + 
+        xlab("Metabolic Pathway") + 
+        ylab(ylabel) + 
+        ggtitle(title) + 
+        theme(axis.title = element_text(family = "Times", face="bold", size=8)) +
+           theme(axis.text = element_text(family = "Times", face="bold", size=6)) +
+        geom_hline(yintercept=0, color = "gray", size=0.5) +
+        scale_fill_gradientn(colours = colorLS, limits = c(-topScale, topScale)) +
+        coord_flip() 
+  return(p)
+}
+
+
+
+```
+
+
+```{r ledge_HM}
+
+
+generateBreaks <- function(min, max, length = 500, assymetric_colors =T, 
+                           colorvector = c("blue", "white", "red")){
+    colorLS <- colorRampPalette(colors = colorvector)(length)
+    extremes <- c(min, max)
+    which_min <- which.min(abs(extremes))
+    which_min <- which.min(abs(extremes))
+   # return(which_top)
+    half  <- length / 2
+    top <- max(abs(extremes))
+    low <- min(abs(extremes))
+    breaks_raw <- c(seq(-abs(top), 0, length.out = half)[c(1:half-1)], seq(0, abs(top), length.out = half+1))
+    breaks_top <- which.min(abs(breaks_raw - extremes[which.max(abs(extremes))])) 
+    breaks_min <- which.min(abs(breaks_raw - extremes[which.min(abs(extremes))])) 
+    #return(c(breaks_min, breaks_top))
+    return(list("breaks" = breaks_raw[c(breaks_min):breaks_top],
+                "colors" = colorLS[c(breaks_min):breaks_top]))
+  
+}
+
+
+ledge_HM <- function(fgsea_output, pathway_select, outcome, sampleOrder = NA, clustercols = FALSE, 
+                     additional_annot_tracks =  F, heatmap_attributes = NULL){
+  #print(pathway)
+  df <- fgsea_output %>%
+        separate_rows(genes, sep = ', ') %>%
+        filter(module_merged == pathway_select)
+    
+  combat_corr_ledge_raw <- combat_corr_filt %>%
+                        as.data.frame(.) %>%
+                        ungroup() %>%
+                        #filter(hgnc_symbol != "") %>%
+                        #rownames_to_column("EnsID") %>%
+                        filter(hgnc_symbol %in% df$genes) %>%
+                        dplyr::select(-EnsID) %>%
+                        gather(PID, value, -hgnc_symbol) %>%
+                        group_by(PID, hgnc_symbol) %>%
+                        summarize(mean = mean(value)) %>%
+                        ungroup() %>%
+                        rename(value = "mean") %>%
+                        group_by(hgnc_symbol) %>%
+                        mutate(value = scale(value)) %>%
+                        ungroup()
+      #return(combat_corr_ledge_raw)
+  ledge_aggregate_order <- combat_corr_ledge_raw %>%
+                      group_by(PID) %>%
+                      summarise(mean = mean(value)) %>%
+                      ungroup() %>%
+                      arrange(mean) %>%
+                      .$PID
+  
+  combat_corr_ledge_raw <- combat_corr_ledge_raw %>%
+                          spread(PID, value) %>%
+                          column_to_rownames("hgnc_symbol") %>%
+                          as.matrix(.)
+  
+  
+  
+  if(is.na(sampleOrder)){
+    combat_corr_ledge <- combat_corr_ledge_raw[,match(ledge_aggregate_order,colnames(combat_corr_ledge_raw))] 
+  } else if(sampleOrder == "average_z"){
+    sampleOrder_filt <- combat_corr_ledge_raw %>%
+                        as.data.frame(.) %>%
+                        rownames_to_column("hgnc_symbol") %>%
+                        gather(PID, value, -hgnc_symbol) %>%
+                        group_by(PID) %>%
+                        summarise(mean = mean(value)) %>%
+                        ungroup() %>%
+                        inner_join(., culmin_df %>% rownames_to_column("PID"), by  = "PID") %>%
+                        arrange(Cumulative_Breadth_dichot, mean) %>%
+                        .$PID
+    combat_corr_ledge <- combat_corr_ledge_raw[,sampleOrder_filt] 
+    } else {
+    sampleOrder_filt <- sampleOrder[sampleOrder %in% colnames(combat_corr_ledge_raw)]
+    combat_corr_ledge <- combat_corr_ledge_raw[,match(sampleOrder_filt,colnames(combat_corr_ledge_raw))] 
+    combat_corr_ledge <- combat_corr_ledge[,culmin_df_sort$PID]
+  }
+   
+  culmin_df_sort <- culmin_df %>%
+                    rownames_to_column("PID") %>%
+                    filter(PID %in% colnames(combat_corr_ledge)) %>%
+                    arrange(Cumulative_Breadth_dichot)
+  
+   paletteLength <- 500
+  # colorLS <- colorRampPalette(colors = c("blue","white","red"))(paletteLength)
+  # #combat_corr_ledge <- combat_corr_ledge[,match(row.names(order_d180),colnames(combat_corr_ledge))]
+  # 
+  # topScale <- max(abs(combat_corr_ledge))
+  # myBreaks <- seq(-topScale, topScale, length.out=paletteLength)
+  myBreaks <- generateBreaks(min = min(combat_corr_ledge) , max = max(combat_corr_ledge), length = paletteLength)
+
+  #return(row.names(combat_corr_ledge))
+  if(additional_annot_tracks == F) {
+     annot_track <- culmin_df[c("Cumulative_Breadth_dichot")]
+      annotation_colors <- list("Cumulative_Breadth_dichot" = c("high" = "#F1978C" , "low" = "#63D7DE"))
+  } else {
+    outcome_df_mod <- outcome_df %>%
+                column_to_rownames("PID")
+    annot_track <- outcome_df_mod[c("Cumulative_Breadth_dichot", "DV1_AUCp_log", "DV2_AUCp_log", 
+                                    "DV3_AUCp_log", "DV4_AUCp_log")]
+    annotation_colors <- list("DV1_AUCp_log" = c("white", "darkgreen"),  "DV2_AUCp_log" = c("white", "darkgreen"),
+                              "DV3_AUCp_log" = c("white", "darkgreen"), "DV4_AUCp_log" = c("white", "darkgreen"),
+                              "Cumulative_Breadth_dichot" = c("high" = "#F1978C" , "low" = "#63D7DE"))
+  }
+ 
+   params <- list(mat = combat_corr_ledge,
+                   scale = "none",
+                   clustering_method  = "ward.D2",
+                   color = myBreaks$colors,
+                    breaks = myBreaks$breaks,
+                    show_rownames = TRUE,
+                    show_colnames = FALSE,
+                    treeheight_row = 8,
+                    treeheight_col = 8,
+                    cluster_cols = clustercols,
+                    annotation_col = annot_track,
+                    annotation_colors = annotation_colors,
+                    cellwidth = 8,
+                    cellheight = 8,
+                    fontsize = 7,
+                    width = 15,
+                    height = 25,
+                    filename = file.path(figureDir,paste(pathway_select, "_ledge.pdf", sep = "")))
+    
+    
+    if(!is.null(heatmap_attributes)){
+      params <- modifyList(params, heatmap_attributes, keep.null = T)
+    }
+
+    p <- do.call("pheatmap", params)            
+           
+ 
+  
+  return(p)
+}
+
+
+
+
+
+
+
+
+
+```
+
+
+```{r gsva_func}
+
+gsva_func <- function(fgsea_table, sep = "; ", method = "zscore", inputDF){
+    exprs <- inputDF %>%
+              filter(Immune_status_at_baseline == 'Naive') %>%
+              filter(Vaccine_status == "Vaccine") %>%
+              filter(Group == "A") %>%
+              dplyr::select(CHEMICAL_ID, PID, value) %>%
+              unique() %>%
+              filter(complete.cases(.)) %>%
+              spread(PID,value) %>%
+              column_to_rownames("CHEMICAL_ID") %>%
+              as.matrix(.)
+    
+   
+    split_df <- fgsea_table %>%
+          separate_rows(leadingEdge, sep = sep) %>%
+          separate_rows(leadingEdge, sep = "! ") %>%
+          split(., f = .$pathway)
+    out <- do.call('rbind', lapply(names(split_df), function(x){
+        gs <- GeneSetCollection(GeneSet(geneIds= unique(split_df[[x]]$leadingEdge), 
+                      setName = x, 
+                      shortDescription = x))
+        eset_filt <- exprs[split_df[[x]]$leadingEdge,]
+        gsva_out <- GSVA::gsva(exprs, gset.idx.list = gs, method = method) %>%
+                    as.data.frame() %>%
+                    rownames_to_column("pathway") %>%
+                    gather(sample, value, -pathway) 
+    })) %>%
+      spread(sample, value) %>%
+      column_to_rownames('pathway') %>%
+      as.matrix()
+          
+  return(out)
+}
+
+
+
+
+```
+
+
+```{r gsva_hm}
+
+gsva_heatmap <- function(gsva_matr, heatmap_attributes = NULL, colors = c("blue", "white", "red"), scale = T){
+    if(scale){
+       mat_scaled <- t(scale(t(gsva_matr), center = T, scale = T))
+       colorLS <- colorAssign(colors = colors, valueVector = mat_scaled)
+    } else {
+      mat_scaled <- gsva_matr
+      colorLS <- colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(100)
+    }
+   
+  
+    params <- list(mat = mat_scaled,
+                   scale = "none",
+                   color = colorLS,
+                   clustering_method  = "ward.D2")
+    
+    
+    if(!is.null(heatmap_attributes)){
+      params <- modifyList(params, heatmap_attributes, keep.null = T)
+    }
+
+    p <- do.call("pheatmap", params)            
+                   
+    return(p)
+    # p <- pheatmap(mat = exprs(eset),
+    #               )
+  
+}
+
+
+
+
+```
+
+
+```{r enrichment_map_functions}
+
+
+compute_modules_func_ledge <- function(fgsea_output, 
+                                       p_threshold = 0.05,
+                                       jaccard_threshold = 0.5, 
+                                       filename,
+                                       p_integration_method = "maxp",
+                                       direction = 'both') {
+  
+  
+  pathDF <- as.data.frame(fgsea_output) %>% 
+    filter(pval < p_threshold) 
+  #### enrichment map
+  # define nes (1 or -1)
+  
+  if(direction %in% c('both', "pos")){
+      nes <- 1 
+  } else {
+    nes <- -1
+  }
+  index <- 1
+  nes_check <- FALSE
+  outGS_list <- c()
+  while(nes_check == FALSE){
+    if(nes == -1) {
+      leDF <- pathDF %>% dplyr::filter(NES < 0)
+    } else {
+      leDF <- pathDF %>% dplyr::filter(NES > 0)
+    }
+    leLS <- sapply(leDF$pathway, simplify = F, USE.NAMES = T, function(x){
+      le <- leDF %>% filter(pathway == x) %>%
+            separate_rows(leadingEdge, sep = "; ") %>%
+            mutate(leadingEdge = as.character(leadingEdge)) %>%
+            .$leadingEdge
+      return(le)
+    })
+    #leLS <- leDF$leadingEdge 
+    
+    #names(leLS) <- leDF$pathway
+    
+    # calculate Jaccard index
+    gsDist <- sapply(leLS, function(gs1) {
+      gsDist <- sapply(leLS, function(gs2) {
+        gs1 <- gs1
+        gs2 <- gs2
+        jaccardIndex <- length(intersect(gs1, gs2))
+        jaccardIndex <- jaccardIndex /
+          (length(gs1) + length(gs2) - jaccardIndex)
+        return(value = jaccardIndex)
+      })
+      return(value = gsDist)
+    })
+    #return(gsDist)
+    # filter based on jaccard threshold
+    gsMin <- gsDist
+    gsMin[gsMin < jaccard_threshold] <- 0
+    
+    # remove all singletons
+    flag <- rowSums(gsMin) > 1 | colSums(gsMin) > 1
+    #return(flag)
+    gsFilt <- gsMin[flag, flag]
+    
+    #return(gsFilt)
+  # create graph
+    g <- graph.adjacency(gsFilt,
+                         mode = "undirected",
+                         weighted = TRUE,
+                         diag = FALSE)
+    # decompose graph into modules and find most frequent genes of each module
+    gD <- decompose(g)
+    
+    outNet <- lapply(1:length(gD), FUN = function(i) {
+      gsName <- V(gD[[i]])$"name"
+      geneFreq <- sort(table(unlist(leLS[gsName])))
+      
+      #geneFreq <- geneFreq[geneFreq >1]
+      # if(length(gsName <= 4)) {
+      #   geneFreq <- geneFreq[geneFreq > 1/2 * length(gsName)]
+      # } else {
+      #   geneFreq <- geneFreq[geneFreq > 1/4 * length(gsName)]
+      # }
+      # geneFreq <- geneFreq[order(geneFreq, decreasing = TRUE)]
+     
+      #return()
+      topGS <- gsName
+      #print(geneFreq)
+      
+      
+      df <- data.frame(gs = paste(topGS, collapse = "! "),
+               genes = paste(names(geneFreq), collapse = "! "),
+               freq  = paste(geneFreq, collapse = "! ")) #%>%
+      
+      return(df)
+      #return(topGS)
+    }) 
+  
+    #return(outNet)
+  
+
+      pval_int <- function(df, integ_method){
+        if(integ_method == "maxp"){
+          df %>% mutate(pval_int = max(pval),
+                        logp = -log(pval_int) * nes )
+            
+        } else if( integ_method == "minp"){
+          df %>% mutate(pval_int = min(pval),
+                        logp = -log(pval_int) * nes)
+        }
+      }
+      outNet <- do.call('rbind', outNet)
+      
+      outNet <- outNet %>%
+                as.data.frame() %>%
+                rowid_to_column("rowid") %>%
+                mutate(gsSplit = gs) %>%
+                separate_rows(gsSplit, sep = "! ") %>%
+                inner_join(., pathDF %>% dplyr::select(pathway, NES, pval),
+                           by = c("gsSplit" = "pathway")) %>%
+                group_by(rowid) %>%
+                pval_int(., integ_method = p_integration_method) %>%
+                mutate(NES_int = ifelse(pval == pval_int, NES, NA )) %>%
+                filter(!is.na(NES_int)) %>%
+                ungroup() %>%
+                dplyr::select(gs, genes, pval_int, logp, NES_int) %>%
+                rename(NES = 'NES_int') %>%
+                #filter(genes != "") %>%
+                unique() %>%
+                ungroup()
+    #return(outNet)
+    if(dim(outNet)[1] >0){
+      outGS_list[[index]] <- outNet
+    }
+    
+      
+      if(nes == -1){
+      nes_check <- TRUE
+      #outfinal <- rbind(outGS_list, outNet)
+      #outfinal <- do.call('rbind', list(outGS_list, outNet))
+      } else if(direction == 'both'){
+        nes <- -1
+        index <- index +1
+      } else {
+        nes_check <- TRUE
+      }
+  }
+    outfinal <- do.call('rbind', outGS_list)
+    #   outGS_list <- c(outGS_list,gsDist)
+      #outNet <- outGS_list
+      #outNet <- do.call(what = rbind, outGS_list) %>%
+    outfinal <- outfinal %>%
+                as.data.frame() %>%
+                arrange(desc(abs(logp))) %>%
+                rowid_to_column("rowid") %>%
+                mutate(module = paste("MODULE", rowid, sep = "_")) %>%
+                mutate(module_newName = "") %>%
+                #dplyr::select(module_newName, module, gs, genes) %>%
+                dplyr::select(module_newName, module, gs, genes, pval_int, logp, NES)# %>%
+       # 
+       # 
+       write_tsv(outfinal, path = filename)
+       # 
+  return(outfinal)
+  #return(out)
+  #return(gsDist)
+}
+
+substitute_modules <- function(fgsea_table, module_table){
+  module_delete <- module_table %>%
+                    separate_rows(gs, sep = "! ") 
+  module_annex <- module_table %>%
+                    mutate(module = ifelse(module_newName != "", module_newName, module)) %>%
+                    rename(pathway = "module",
+                           pval = "pval_int",
+                           leadingEdge = "genes") %>%
+                    dplyr::select(pathway, pval, logp, NES, leadingEdge)
+  df <- fgsea_table %>%
+          ungroup(.) %>%
+          filter(!pathway %in% module_delete$gs) %>%
+          mutate(logp = -log(pval) * sign(NES)) %>%
+          dplyr::select(pathway, pval, logp, NES, leadingEdge) %>%
+          bind_rows(module_annex) %>%
+          arrange(desc(abs(logp)))
+  return(df)
+}
+
+
+```
+
+
+
+```{r local_jaccard}
+local_jaccard <- function(fgsea_table1, fgsea_table2, sep = ', '){
+   leDF <- fgsea_table1
+   leDF2 <- fgsea_table2
+   leLS <- sapply(leDF$pathway, simplify = F, USE.NAMES = T, function(x){
+      le <- leDF %>% filter(pathway == x) %>%
+            separate_rows(leadingEdge, sep = sep) %>%
+            .$leadingEdge
+      return(le)
+    })
+    leLS2 <- sapply(leDF2$pathway, simplify = F, USE.NAMES = T, function(x){
+      le <- leDF2 %>% filter(pathway == x) %>%
+            separate_rows(leadingEdge, sep = sep) %>%
+            .$leadingEdge
+      return(le)
+    })
+    #leLS <- leDF$leadingEdge 
+    
+    #names(leLS) <- leDF$pathway
+    
+    # calculate Jaccard index
+    gsDist <- sapply(leLS, function(gs1) {
+      gsDist <- sapply(leLS2, function(gs2) {
+        gs1 <- gs1
+        gs2 <- gs2
+        jaccardIndex <- length(intersect(gs1, gs2))
+        jaccardIndex <- jaccardIndex /
+          (length(gs1) + length(gs2) - jaccardIndex)
+        return(value = jaccardIndex)
+      })
+      return(value = gsDist)
+    })
+    
+    # g <- graph.adjacency(gsDist,
+    #                      mode = "undirected",
+    #                      weighted = TRUE,
+    #                      diag = FALSE)
+    # # decompose graph into modules and find most frequent genes of each module
+    # gD <- decompose(g)
+    # 
+    # outNet <- lapply(1:length(gD), FUN = function(i) {
+    #   gsName <- V(gD[[i]])$"name"
+    #   geneFreq <- sort(table(unlist(leLS[gsName])))
+    return(gsDist)
+  
+}
+
+
+
+
+```
+
+
+
+```{r ledge_hm}
+ledge_hm <- function(fgsea_df,geneset,DEM,pval_thr = 0.25,figure_path, inputDF, contrast, pData){
+  ledge <- as.data.frame(fgsea_df) %>%
+        filter(pathway == geneset) %>%
+        .$leadingEdge
+  DEM_filt <- DEM %>%
+              filter(CHEMICAL_ID %in% ledge[[1]]) %>%
+              filter(p.value < pval_thr)
+  #print(DEM_filt)
+  ledge_matrix <- inputDF %>%
+              filter(CHEMICAL_ID %in% ledge[[1]]) %>%
+              dplyr::select(PID, contrast, BIOCHEMICAL,value) %>%
+              filter(complete.cases(.)) %>%
+              spread(BIOCHEMICAL,value) %>%
+              column_to_rownames("PID") %>%
+              dplyr::select(-contrast) %>%
+              as.matrix(.)
+  
+ order <- inputDF %>%
+         dplyr::select(PID, contrast) %>%
+        unique(.) %>% 
+        filter(complete.cases(.)) 
+ 
+ 
+ 
+
+ #print(ledge_matrix[1])
+ order <- order[order(order[[2]]),]$PID
+ ledge_matrix <- ledge_matrix[match(order, row.names(ledge_matrix)),]
+  print(ledge_matrix)
+  # ledge_matrix <- ledge_matrix[order(ledge_matrix[contrast]),]
+  #ledge_matrix[contrast] <- NULL
+  ledge_matrix <- t(scale(ledge_matrix))
+  
+  paletteLength <- 500
+  colorLS <- colorRampPalette(colors = c("blue", "cyan",
+                                         "white",
+                                        "yellow", "red"))(paletteLength)
+  
+  topScale <- max(abs(min(ledge_matrix)),abs(max(ledge_matrix)))
+  myBreaks <- seq(-topScale, topScale, length.out=paletteLength)
+  
+ 
+ 
+  pData_annot <- pData %>%
+                as.data.frame(.) %>%
+                column_to_rownames("PID")
+  
+  p <- pheatmap(mat = ledge_matrix,
+                #scale = "row",
+                annotation_col = pData_annot[contrast],
+                cluster_cols = FALSE, 
+                color = colorLS,
+                breaks = myBreaks,
+                cellheight = 8,
+                cellwidth = 8,
+                show_colnames = FALSE)
+  pdf(file = file.path(figureDir,paste("ledge_", geneset,"_",contrast,".pdf", sep ="")))
+  print(p)
+  dev.off()
+}
+
+```
+
+
+```{r make ledge_matr}
+
+make_ledge_matr <- function(fgsea_df,DEM,pval_thr = 0.25, inputDF, contrast = 'Cumulative_Breadth_dichot', pData, sep = '! ', scale = T, 
+                              colors =  c("blue", "white", "red")){
+  
+  ledge <- as.data.frame(fgsea_df) %>%
+        separate_rows(leadingEdge, sep = sep) %>%
+        separate_rows(leadingEdge, sep = "; " ) %>%
+        filter(leadingEdge %in% (DEM %>% filter(p.value < pval_thr) %>% .$CHEMICAL_ID)) %>%
+        arrange(desc(logp), pathway)
+  
+  ledge_annot <- ledge %>%
+                  inner_join(., inputDF %>% 
+                               dplyr::select(CHEMICAL_ID, BIOCHEMICAL) %>%
+                               unique() , by = c('leadingEdge' = "CHEMICAL_ID")) %>%
+                  group_by(BIOCHEMICAL) %>%
+                  mutate(pathways = paste(pathway, collapse = '; ')) %>%
+                  dplyr::select(BIOCHEMICAL, pathways) %>%
+                  unique() %>%
+                  ungroup()
+  
+  ledge_matrix <- inputDF %>%
+              filter(CHEMICAL_ID %in% ledge$leadingEdge) %>%
+              dplyr::select(PID, contrast, BIOCHEMICAL,value) %>%
+              filter(complete.cases(.)) %>%
+              spread(BIOCHEMICAL,value) %>%
+              column_to_rownames("PID") %>%
+              dplyr::select(-contrast) %>%
+              as.matrix(.)
+  
+  if(scale){
+       #mat_scaled <- t(scale(ledge_matrix, center = T, scale = T))
+      ledge_matrix <- ledge_matrix %>%
+                    as.data.frame(.) %>%
+                    rownames_to_column('PID') %>%
+                    gather(metab, value, -PID) %>%
+                    group_by(metab) %>%
+                    mutate(quant = ntile(value, n = 100)) %>%
+                    ungroup() %>%
+                    dplyr::select(-value) %>%
+                    spread(metab, quant) %>%
+                    column_to_rownames('PID') %>%
+                    as.matrix()
+                    
+        
+        
+        mat_scaled <- t(scale(ledge_matrix, center = T, scale = T)) 
+  } 
+  return(list('ledge' = ledge, 'ledge_matrix' = mat_scaled, "ledge_annot" = ledge_annot))
+}
+
+
+
+```
+
+
+```{r ledge_hm_mod}
+ledge_hm_combined <- function(fgsea_df,DEM,pval_thr = 0.25,figure_path, inputDF, contrast = 'Cumulative_Breadth_dichot', pData, sep = '! ', scale = T, filename, heatmap_attributes = NULL ,
+                              colors =  c("blue", "white", "red"), rowlogp = NULL, order_features = NA, order_method = "pos_avg"){
+  ledge <- as.data.frame(fgsea_df) %>%
+        separate_rows(leadingEdge, sep = sep) %>%
+        separate_rows(leadingEdge, sep = "; " ) %>%
+        filter(leadingEdge %in% (DEM %>% filter(p.value < pval_thr) %>% .$CHEMICAL_ID)) %>%
+        arrange(desc(logp), pathway)
+        #.$leadingEdge
+  
+  
+  
+  row_annot <- ledge %>%
+              inner_join(., inputDF, by = c('leadingEdge' = "CHEMICAL_ID")) %>%
+              dplyr::select(BIOCHEMICAL, pathway) %>%
+              unique() %>%
+              rowid_to_column('rowid') %>%
+              group_by(pathway) %>%
+              mutate(group_row = row_number()) %>%
+              mutate(last = ifelse(group_row == max(group_row), 'last', NA)) %>%
+              ungroup() %>%
+              column_to_rownames("BIOCHEMICAL") #%>%
+  
+  
+  ledge_corr_sero <- do.call('rbind',metabolon_DEM[grepl("AUCp_log|dichot", names(metabolon_DEM))]) %>%
+                    filter(BIOCHEMICAL %in% row.names(row_annot)) %>%
+                    ungroup() %>%
+                    mutate(logp = -log10(p.value) * sign(effect_size)) %>%
+                    mutate(logp = ifelse(p.value > pval_thr, 0, logp)) %>%
+                    mutate(outcome = gsub("_AUCp", "", outcome)) %>%
+                    mutate(outcome = gsub("Cumulative_", "", outcome)) %>%
+                    mutate(outcome = gsub("_dichot", "", outcome)) %>%
+                    dplyr::select(BIOCHEMICAL, outcome, logp) %>%
+                    spread(outcome, logp) %>%
+                    column_to_rownames("BIOCHEMICAL")
+  #return(ledge_corr_sero)
+
+
+  colorAnnot_rows <- sapply(colnames(ledge_corr_sero), simplify = F , USE.NAMES = T, function(x){
+    out <- sapply(colnames(ledge_corr_sero), simplify = F, USE.NAMES = T, function(y){
+            df_filt <- ledge_corr_sero[,y]
+            sig_annot_values  <-  colorAssign(df_filt, 
+                                              scale_limits = c(-max(abs(ledge_corr_sero)),
+                                                               max(abs(ledge_corr_sero))),
+                                              colors = c("blue", "white", "red"))
+            return(sig_annot_values)
+          })
+  
+  
+  })
+                          
+
+  
+  gaps <- row_annot %>%
+          filter(last == 'last') %>%
+          .$rowid
+  #return(row_annot)
+
+    row_annot <- row_annot %>%
+                  rownames_to_column("BIOCHEMICAL") %>%
+                  dplyr::select(BIOCHEMICAL, pathway) %>%
+                  left_join(., ledge_corr_sero[,order(ncol(ledge_corr_sero):1)] %>% rownames_to_column("BIOCHEMICAL"), by = "BIOCHEMICAL" ) %>%
+                  dplyr::select(pathway, Breadth, everything()) %>%
+                  column_to_rownames("BIOCHEMICAL")
+  
+  
+  
+  
+  DEM_filt <- DEM %>%
+              filter(CHEMICAL_ID %in% ledge$leadingEdge) %>%
+              filter(p.value < pval_thr)
+  #print(DEM_filt)
+  ledge_matrix <- inputDF %>%
+              filter(CHEMICAL_ID %in% ledge$leadingEdge) %>%
+              dplyr::select(PID, contrast, BIOCHEMICAL,value) %>%
+              filter(complete.cases(.)) %>%
+              spread(BIOCHEMICAL,value) %>%
+              column_to_rownames("PID") %>%
+              dplyr::select(-contrast) %>%
+              as.matrix(.)
+ 
+  pos_pathway <- row.names(row_annot[row_annot$pathway %in% fgsea_df[fgsea_df$NES >0, ]$pathway,])
+
+  # order <- as.data.frame(ledge_matrix) %>%
+  #         rownames_to_column("PID") %>%
+  #         gather(metab, value, -PID) %>%
+  #         group_by(metab) %>%
+  #         mutate(value = scale(value)) %>%
+  #         ungroup() %>%
+  #         group_by(PID) %>%
+  #         summarise(mean = mean(value)) %>%
+  #         ungroup() %>%
+  #         inner_join(., outcome_df_filt, by = "PID") %>%
+  #         mutate(mean = ifelse(Cumulative_Breadth_dichot == "high", mean + 100, mean)) %>%
+  #         arrange(mean) %>%
+  #         .$PID
+    
+        # 
+        #  dplyr::select(PID, contrast) %>%
+        # unique(.) %>% 
+        # filter(complete.cases(.)) 
+ 
+ #return(order)
+ #return(row_annot)
+
+ #print(ledge_matrix[1])
+ #order <- order[order(order[[2]]),]$PID
+ #ledge_matrix <- ledge_matrix[match(order, row.names(ledge_matrix)),row.names(row_annot)]
+  #print(ledge_matrix)
+  # ledge_matrix <- ledge_matrix[order(ledge_matrix[contrast]),]
+  #ledge_matrix[contrast] <- NULL
+  #ledge_matrix <- t(scale(ledge_matrix))
+  #return(ledge_matrix)
+  if(scale){
+       #mat_scaled <- t(scale(ledge_matrix, center = T, scale = T))
+      ledge_matrix <- ledge_matrix %>%
+                    as.data.frame(.) %>%
+                    rownames_to_column('PID') %>%
+                    gather(metab, value, -PID) %>%
+                    group_by(metab) %>%
+                    mutate(quant = ntile(value, n = 100)) %>%
+                    ungroup() %>%
+                    dplyr::select(-value) %>%
+                    spread(metab, quant) %>%
+                    column_to_rownames('PID') %>%
+                    as.matrix()
+                    
+        
+        
+        mat_scaled <- t(scale(ledge_matrix, center = T, scale = T))            
+
+       colorLS <- colorAssign(valueVector = mat_scaled, colors = colors )
+    } else {
+      mat_scaled <- t(ledge_matrix)
+      colorLS <- colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(100)
+    }
+ 
+  #return(mat_scaled)
+  order_features_select <- row.names(row_annot[row_annot$pathway == order_features,])
+
+  mat_scaled <- order_matrix_cols(mat_scaled, stat_df = DEM_filt, featureID = "BIOCHEMICAL", select_features  = order_features, method = order_method)
+
+  mat_scaled <- mat_scaled[row.names(row_annot),]
+  #return(mat_scaled)
+     pData_annot <- pData %>%
+                as.data.frame(.) %>%
+                dplyr::rename(Breadth = "Cumulative_Breadth_dichot") %>%
+                column_to_rownames("PID")
+    annotation_colors <- list("Breadth" = c("high" = "#F1978C" , "low" = "#63D7DE"))
+    #annotation_colors <- c(annotation_colors,  colorAnnot_rows$DV1_log)
+    #return(annotation_colors)
+    #return(list("mat" = mat_scaled, "pD" = pData_annot, "row" = row_annot, "colorLS" = colorLS))
+    params <- list(mat = mat_scaled,
+                   scale = "none",
+                   color = names(colorLS),
+                   clustering_method  = "ward.D2",
+                   annotation_colors = annotation_colors,
+                   cellheight = 8,
+                   cellwidth = 8,
+                   gaps_row = gaps,
+                   #annotation_col = pData_annot[c(contrast, "DV3_AUCp_log")],
+                   annotation_col = pData_annot["Breadth"],
+                   annotation_row = row_annot["pathway"]
+                   )
+   
+    
+    if(!is.null(heatmap_attributes)){
+      params <- modifyList(params, heatmap_attributes, keep.null = T)
+    }
+
+    p <- do.call("pheatmap", params) 
+  
+  return(p)
+ 
+  
+  # pdf(file = filename)
+  # print(p)
+  # dev.off()
+}
+
+```
+
+

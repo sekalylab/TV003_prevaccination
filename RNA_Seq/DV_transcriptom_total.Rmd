@@ -1,0 +1,4018 @@
+---
+title: "DV_pilot_2ndrun"
+author: "Adam Pelletier"
+date: "7/9/2018"
+output: 
+  html_document: default
+  md_document:
+    variant: markdown_github
+    pandoc_args: "--no-wrap"
+    
+---
+
+# Dengue Vaccine Phase II trial transcriptomic analysis
+
+## Background
+This is a transcriptomic analysis of the initial 17 patients from the Phase II Dengue vaccine clinical trial.
+A first run was performed, which yielded nothing. However, upon investigation, the quality of the sequencing run was found to be extremely low, which mapped back to a problematic kit BGI used. Upon resequencing with a new kit, the mappability is supposedly higher. 
+
+We'll compare the count reads, mappability, and then proceed to downstream analysis. 
+
+
+```{r setup, message = FALSE, warning=FALSE}
+#### Load required packages for analysis
+## Some packages may require installation from Bioconductor : "https://bioconductor.org/install/" 
+suppressPackageStartupMessages(library(rstudioapi))
+suppressPackageStartupMessages(library(plyr))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(purrr))
+suppressPackageStartupMessages(library(tidyr))
+suppressPackageStartupMessages(library(pheatmap))
+suppressPackageStartupMessages(library(DESeq2))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(biomaRt))
+suppressPackageStartupMessages(library(GSEABase))
+suppressPackageStartupMessages(library(fgsea))
+suppressPackageStartupMessages(library(stringr))
+suppressPackageStartupMessages(library(tibble))
+suppressPackageStartupMessages(library(GSVA))
+suppressPackageStartupMessages(library(cluster))
+suppressPackageStartupMessages(library(apeglm))
+suppressPackageStartupMessages(library(ggrepel))
+suppressPackageStartupMessages(library(sva))
+suppressPackageStartupMessages(library(affy))
+suppressPackageStartupMessages(library(igraph))
+suppressPackageStartupMessages(library(readr))
+suppressPackageStartupMessages(library(broom))
+suppressPackageStartupMessages(library(SpidermiR))
+library(pvca)
+suppressPackageStartupMessages(library(PCAtools))
+suppressPackageStartupMessages(library(GGally))
+suppressPackageStartupMessages(library(UniProt.ws))
+suppressPackageStartupMessages(library(ggpubr))
+suppressPackageStartupMessages(library(MetaIntegrator))
+suppressPackageStartupMessages(library(Hmisc))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(getwd())
+```
+
+## RNA-Seq Transcriptomic Analysis
+
+
+## Setup file paths and initiate directories
+
+```{r }
+
+setup_dir <- function(dir_string) { 
+  ### Verifies creates a directory if it doesn't exist. Returns the dir_path
+  if (dir.exists(dir_string)){
+    dir_set <- dir_string
+  } else {
+    dir.create(dir_string) 
+    dir_set <- dir_string
+  }
+  return(dir_set)
+}
+
+
+
+countsdir <- "data/counts/BGI_second_run/"
+diagnosticDir <- "data/counts/BGI_second_run/"
+#outcomeDir <- "~/Documents/RPS_Case/projects/Denv/outcomes/DV_outcomes_02152019_ANP.txt"
+outcomeDir <- "~/Documents/RPS_Case/projects/Denv/outcomes/DV_outcomes_05082019_ANP.txt"
+
+outcome_df <- read.table(outcomeDir, sep = "\t", header = TRUE) %>% 
+            mutate(PID = as.character(PID)) %>%
+            dplyr::filter(DV1_AUCp_log != "NA") %>%
+            mutate(Cumulative_Breadth_dichot = factor(Cumulative_Breadth_dichot, levels = c("low", "high"))) %>%
+            mutate(D91_Breadth_dichot = factor(D91_Breadth_dichot, levels = c( "low", "high")))
+  
+            
+
+demographics <- read_excel(path = "../outcomes/DEN-01-IB_ExtracaoDemograficoVacFA_1 RBJune2018 (1).xlsx") %>% mutate(PID = paste("DEN", PID, sep = ""))
+
+
+
+
+if(dir.exists("exploratory_plot") == FALSE){
+  dir.create("exploratory_plot")
+}
+if(dir.exists("deg_plot") == FALSE){
+  dir.create("deg_plot")
+}
+
+firstRun <- "~/Documents/RPS_Case/projects/Denv/RNA_Seq/Pilot_17patients"
+secondRun <- "2nd_run"
+
+rawDir 		  <- "data/counts/First_run_BGI/"
+dataDir 	  <- "data/counts/First_run_BGI/"
+inputDir <- setup_dir("input")
+genesetsDir <- setup_dir(file.path(firstRun,"input/genesets"))
+# #diagnosticDir <- "diagnostic_plot"
+# exploDir	  <- "exploratory_plot"
+# degDir 	      <- "deg_plot"
+
+
+outDir <- setup_dir("output")
+figureDir <- setup_dir("output/figures")
+dataOutDir <- setup_dir("output/data")
+
+
+first_run_counts <- list.files(file.path(firstRun,"data/counts/First_run_BGI/"), recursive = TRUE,
+                               pattern = "_genecounts", full.names = TRUE)
+first_run_names <- list.files(file.path(firstRun, "data/counts/First_run_BGI/"), recursive = TRUE, pattern = "rename_schema.csv", full.names = TRUE)
+first_run_name_df <- read.csv(first_run_names) %>% dplyr::select(-X) %>%
+      mutate(PID = unlist(str_extract_all(original, "DEN[0-9]+(A|B)"))) %>%
+      mutate(Shot = unlist(str_extract_all(original, "Shot[0-2]"))) %>%
+      mutate(Timepoint = unlist(str_extract_all(original, "D[0-9]+"))) %>%
+      mutate(Batch = "1") %>%
+      mutate(sample_id = as.character(sample_id)) %>%
+      dplyr::select(-original, -new_filename) %>%
+      unique(.)
+
+
+first_run_df <- c()
+for(i in first_run_counts){
+  filename <- str_extract_all(i,"[0-9]+_genecounts", simplify = FALSE) [[1]]
+  counts <- read.csv(i, sep="\t", header = FALSE)
+  colnames(counts) <- c("Ensembl.ID", filename)
+  if(is.data.frame(first_run_df)){
+    first_run_df <- merge(x = first_run_df, y = counts, by = "Ensembl.ID")
+  } else {
+    first_run_df <- counts
+  }
+}
+
+
+
+
+second_run_counts <- list.files(file.path(secondRun,"denv_rna_seq_run2/mRNASeq/raw"), recursive = TRUE, pattern = "_genecounts", full.names = TRUE)
+
+second_run_names <- list.files(file.path(secondRun,"denv_rna_seq_run2/mRNASeq/raw"), recursive = TRUE, pattern = "rename_schema.csv", full.names = TRUE)
+
+second_run_df <- c()
+for(i in second_run_counts){
+  filename <- str_extract_all(i,"[0-9]+_genecounts", simplify = FALSE) [[1]]
+  counts <- read.csv(i, sep="\t", header = FALSE)
+  colnames(counts) <- c("Ensembl.ID", filename)
+  if(is.data.frame(second_run_df)){
+    second_run_df <- merge(x = second_run_df, y = counts, by = "Ensembl.ID")
+  } else {
+    second_run_df <- counts
+  }
+}
+
+second_run_name_df <- read.csv(second_run_names) %>% dplyr::select(-X) %>%
+      mutate(PID = as.character(unlist(str_extract_all(original, "DEN[0-9]+(A|B)")))) %>%
+      mutate(Shot = "Shot1") %>%
+      mutate(Timepoint = "D0") %>%
+      dplyr::select(sample_id, PID, Shot, Timepoint) %>%
+      mutate(Batch = "2") %>%
+      mutate(sample_id = as.character(sample_id)) %>%
+      unique(.)
+
+
+merged_annotations <- rbind(first_run_name_df, second_run_name_df)
+#merged_annotations <- first_run_name_df
+#####Uncomment this when data available
+#merged_runs <- merge(first_run_df, second_run_df, by = "Ensembl.ID")
+
+merged_annotations <- merge(merged_annotations, outcome_df, by= "PID")
+
+merged_runs <- merge(first_run_df, second_run_df, by = "Ensembl.ID")
+countMatrix <- merged_runs %>%
+         gather(file, count, -Ensembl.ID) %>%
+         mutate(file_number = as.character(unlist(str_extract_all(file, "[0-9]+")))) %>%
+         inner_join(merged_annotations , by = c("file_number" = "sample_id")) %>%
+         filter(Timepoint == "D0") %>%
+         filter(Shot == "Shot1") %>%
+         filter(Vaccine_status == "Vaccine") %>%
+         filter(Group == "A") %>%
+         filter(Immune_status_at_baseline == "Naive") %>%
+         dplyr::select(Ensembl.ID, file_number, count) %>%
+         spread(file_number,count) %>%
+         column_to_rownames("Ensembl.ID") %>%
+         as.matrix(.)
+         
+merged_annotations_filt <- merged_annotations[merged_annotations$sample_id %in% colnames(countMatrix),] %>%
+                    mutate(Batch = as.factor(Batch)) %>%
+                    arrange(match(sample_id, colnames(countMatrix))) %>%
+                    column_to_rownames("sample_id") 
+
+unsupervised_clust_caprion <- read.csv("../unsupervised_clustering_caprion/groupA_unsupervised_clustering_IDs.csv") %>%
+                                mutate(PID = paste("DEN", PID, "A", sep = "")) 
+
+merged_annotations_caprion_filt <- merged_annotations[merged_annotations$sample_id %in% colnames(countMatrix),] %>%
+                                  mutate(Batch = as.factor(Batch)) %>%
+                                  arrange(match(sample_id, colnames(countMatrix))) %>%
+                                  inner_join(., unsupervised_clust_caprion, by = "PID") %>%
+                                  dplyr::select(PID, sample_id, Batch, Group, values) %>%
+                                  rename(Polyvalence = "values") %>%
+                                  column_to_rownames("sample_id") 
+head(countMatrix)
+
+
+#export pilot vs 2nd batch patients for comparisons (question from Caprion)
+batch_df <- rbind(second_run_name_df, first_run_name_df)  %>%
+            group_by(PID) %>%
+            mutate(count = n()) %>%
+            ungroup(.) %>%
+            mutate(keep = ifelse(count == 1, "yes",
+                                 ifelse(count == 2 & Batch == 1, "yes", "no"))) %>%
+            filter(keep == "yes") 
+            
+write.csv(batch_df, file = file.path(dataOutDir,"batch_IDs.csv"))
+
+
+
+
+```
+
+
+
+``` {r readStats_1st_run}
+
+#  Read counts files
+fileLS     <-   list.files(path = "Pilot_17patients/data/counts/First_run_BGI/",
+                           			   pattern    =   "genecounts$",
+                           			   full.names =   TRUE,
+                           			   recursive  =   TRUE)
+countMat   <-   lapply(fileLS, FUN = function(file)
+{
+return(value = read.table(file      =  file,
+                          					   sep       =  "\t",
+                          					   col.names =  c("id", "value")))})
+
+#  Verify that all the files have the same transcript ids
+id   <-  countMat[[1]][, "id"]
+flag <- sapply(countMat,FUN = function(file)
+{
+return(value = all(id == file[, "id"]))})
+if (any(!flag))
+{
+print("warning some tag id missing in some of the count files")        
+}
+#  Merge all the count files
+countMat <- sapply(countMat, FUN = function(file) {
+							   	   		file[, "value"]})
+										rownames(countMat) <- id
+ 								    colnames(countMat) <- gsub(pattern      =   "_genecounts",
+                           															replacement  =   "",
+                          	 														basename(fileLS))
+#   Write the count matrix
+write.table(countMat,
+            	  file = file.path("2nd_run/input", "expCounts.txt"),
+            	   sep  = "\t")
+countDF <-  as.data.frame(countMat)
+
+ReadStats <- read.delim(file = "Pilot_17patients/data/counts/First_run_BGI/ReadStats.txt",
+                       					header = FALSE,
+                       					stringsAsFactors = FALSE) %>%
+                      unique() %>%
+                      dplyr::rename(SampleID = V1,
+                       				   		  NumberReads = V2,
+                       				   		  Class = V3)
+Counted <- data.frame(counts = colSums(countDF))
+
+plotDF <- reshape(ReadStats,
+                  			  direction = "wide",
+                  			  timevar   = "Class",
+                  			  idvar     = "SampleID") %>%
+                mutate(exonic = Counted$counts[match(SampleID, 
+									   											    table=rownames(Counted))],
+							intronic_and_intergenic = NumberReads.UniqMapped-exonic,
+							trimmed = NumberReads.TotalReads-NumberReads.Surviving,
+							multiMap =  NumberReads.Multimapped,
+						    unaligned = NumberReads.Surviving-
+	           									NumberReads.Multimapped-
+	           							        NumberReads.UniqMapped ) %>%
+	           dplyr::select(SampleID,
+	           		 				exonic, 
+	           		 				intronic_and_intergenic,
+	           		 				trimmed,
+	           		 				multiMap,
+	           		 				unaligned) %>%
+	           gather(key, value, -SampleID) %>%
+	           dplyr::rename(Class = key,
+	           		 				   NumberReads = value) %>%
+	           mutate(SampleID = as.factor(SampleID))
+ #plot
+ plotDF_p <- plotDF %>%
+   spread(Class, NumberReads) %>%
+   mutate(TotalReads = rowSums(.[2:6])) %>%
+   gather(Class, NumberReads, -SampleID,-TotalReads) %>%
+   mutate(Read_prop = NumberReads / TotalReads) %>%
+   dplyr::select(-NumberReads,-TotalReads) %>%
+   mutate(Class = factor(Class))
+   
+   
+ rS <- ggplot(data    = plotDF,
+             		 mapping = aes(x    = SampleID, 
+                           				 	  y    = NumberReads,
+                           				 	  by   = Class, 
+                           					  fill = factor(Class))) +		   
+         geom_bar(stat   = "identity", color = "black") + 
+      	 theme(axis.text.x      = element_text(angle=90, size=6),
+           	   		axis.line        = element_line(color = "grey"),
+               		panel.background = element_blank()) +
+      	 scale_y_continuous(expand = c(0, 0)) +
+      	 labs(x="SampleID")
+
+pdf(file   =    "output/figures/1st_run_run1_ReadStats.pdf",
+    width  = 20,
+    height = 6)
+print(rS)
+dev.off()
+
+print(rS)
+```
+
+
+``` {r readStats_2nd_run}
+
+#  Read counts files
+fileLS     <-   list.files(path = "2nd_run",
+                           			   pattern    =   "genecounts$",
+                           			   full.names =   TRUE,
+                           			   recursive  =   TRUE)
+countMat   <-   lapply(fileLS, FUN = function(file)
+{
+return(value = read.table(file      =  file,
+                          					   sep       =  "\t",
+                          					   col.names =  c("id", "value")))})
+
+#  Verify that all the files have the same transcript ids
+id   <-  countMat[[1]][, "id"]
+flag <- sapply(countMat,FUN = function(file)
+{
+return(value = all(id == file[, "id"]))})
+if (any(!flag))
+{
+print("warning some tag id missing in some of the count files")        
+}
+#  Merge all the count files
+countMat <- sapply(countMat, FUN = function(file) {
+							   	   		file[, "value"]})
+										rownames(countMat) <- id
+ 								    colnames(countMat) <- gsub(pattern      =   "_genecounts",
+                           															replacement  =   "",
+                          	 														basename(fileLS))
+#   Write the count matrix
+write.table(countMat,
+            	  file = file.path("2nd_run/input", "expCounts.txt"),
+            	   sep  = "\t")
+countDF <-  as.data.frame(countMat)
+
+ReadStats <- read.delim(file = "2nd_run/denv_rna_seq_run2/mRNASeq/raw/ReadStats.txt",
+                       					header = FALSE,
+                       					stringsAsFactors = FALSE) %>%
+                      unique() %>%
+                      dplyr::rename(SampleID = V1,
+                       				   		  NumberReads = V2,
+                       				   		  Class = V3)
+Counted <- data.frame(counts = colSums(countDF))
+
+plotDF <- reshape(ReadStats,
+                  			  direction = "wide",
+                  			  timevar   = "Class",
+                  			  idvar     = "SampleID") %>%
+                mutate(exonic = Counted$counts[match(SampleID, 
+									   											    table=rownames(Counted))],
+							intronic_and_intergenic = NumberReads.UniqMapped-exonic,
+							trimmed = NumberReads.TotalReads-NumberReads.Surviving,
+							multiMap =  NumberReads.Multimapped,
+						    unaligned = NumberReads.Surviving-
+	           									NumberReads.Multimapped-
+	           							        NumberReads.UniqMapped ) %>%
+	           dplyr::select(SampleID,
+	           		 				exonic, 
+	           		 				intronic_and_intergenic,
+	           		 				trimmed,
+	           		 				multiMap,
+	           		 				unaligned) %>%
+	           gather(key, value, -SampleID) %>%
+	           dplyr::rename(Class = key,
+	           		 				   NumberReads = value) %>%
+	           mutate(SampleID = as.factor(SampleID))
+ #plot
+ plotDF_p <- plotDF %>%
+   spread(Class, NumberReads) %>%
+   mutate(TotalReads = rowSums(.[2:6])) %>%
+   gather(Class, NumberReads, -SampleID,-TotalReads) %>%
+   mutate(Read_prop = NumberReads / TotalReads) %>%
+   dplyr::select(-NumberReads,-TotalReads) %>%
+   mutate(Class = factor(Class))
+   
+   
+ rS <- ggplot(data    = plotDF,
+             		 mapping = aes(x    = SampleID, 
+                           				 	  y    = NumberReads,
+                           				 	  by   = Class, 
+                           					  fill = factor(Class))) +		   
+         geom_bar(stat   = "identity", color = "black") + 
+      	 theme(axis.text.x      = element_text(angle=90, size=6),
+           	   		axis.line        = element_line(color = "grey"),
+               		panel.background = element_blank()) +
+      	 scale_y_continuous(expand = c(0, 0)) +
+      	 labs(x="SampleID")
+
+pdf(file   =    "output/figures/BGI_Batch2_ReadStats.pdf",
+    width  = 20,
+    height = 6)
+print(rS)
+dev.off()
+
+print(rS)
+```
+
+
+
+
+```{r }
+
+
+# meta_dds_test <- list( 
+#             "D28_Breadth" = DESeqDataSetFromMatrix(
+#               countData = countMatrix,
+#               colData = merged_annotations_filt,
+#               design = ~ D28_Breadth),
+#            "DV1_AUCp_log" = DESeqDataSetFromMatrix(
+#               countData = countMatrix,
+#               colData = merged_annotations_filt,
+#               design = ~ DV1_AUCp_log )
+#            )
+
+selected_outcomes <- c("D180_Breadth","D28_Breadth","D56_Breadth","D91_Breadth",
+                       "D208_Breadth","D236_Breadth","D271_Breadth",
+                       "DV1_AUCp_log","DV2_AUCp_log","DV3_AUCp_log","DV4_AUCp_log",
+                       "DV1_AUCb_log","DV2_AUCb_log", "DV3_AUCb_log", "DV4_AUCb_log",
+                       "DV1_AUCp","DV2_AUCp","DV3_AUCp","DV4_AUCp")
+
+selected_outcomes2 <- c( "DV1_AUCp_log","DV2_AUCp_log","DV3_AUCp_log","DV4_AUCp_log", 
+                         "D91_Breadth_dichot", "Cumulative_Breadth_dichot")
+selected_outcomes3 <- c( "D91_Breadth_dichot", "Cumulative_Breadth_dichot")
+outcomes_unsup <- c("Polyvalence")
+# 
+# meta_dds <- list()
+# for(i in selected_outcomes ){
+#     annotations_per_outcome <-  merged_annotations_filt 
+#     colIndex <- which(colnames(annotations_per_outcome) == i)
+#     colnames(annotations_per_outcome)[colIndex] <- "outcome_var"
+#     annotations_per_outcome <- annotations_per_outcome[!is.na(annotations_per_outcome$outcome_var), ]
+#     countMatrix_per_outcome <- countMatrix[,colnames(countMatrix) %in% row.names(annotations_per_outcome)]
+#     meta_dds[[i]]$dds <-  DESeqDataSetFromMatrix(
+#                                   countData = countMatrix_per_outcome,
+#                                   colData = annotations_per_outcome,
+#                                   design = ~ Batch + outcome_var )
+# }
+# 
+# for(i in names(meta_dds)){
+#   dds <- meta_dds[[i]]$dds
+#   keep <- rowSums(counts(dds)) >= 10  # discard genes with less than 10 reads: low quality filtering
+#   dds <- dds[keep,]
+#   dds <- DESeq(dds)
+#   meta_dds[[i]]$dds <- dds
+#   meta_dds[[i]]$rld <- rlog(dds, blind = FALSE)
+#   meta_dds[[i]]$res <- results(dds)
+#   # meta_dds[[i]]$vst <- vst(meta_dds[[i]]$dds, blind = FALSE)
+#   # meta_dds[[i]]$resLFC <- lfcShrink (meta_dds[[i]]$dds, coef = 3, type = "apeglm")
+# }
+# 
+# 
+# for(i in names(meta_dds)){
+#   sig <- meta_dds[[i]]$res
+#   sig <- sig[!is.na(sig$pvalue),]
+#   sig <- sig[sig$pvalue < 0.05,]
+#   meta_dds[[i]]$sig <- sig
+# }
+
+
+meta_dds2 <- list()
+for(i in selected_outcomes3 ){
+    annotations_per_outcome <-  merged_annotations_filt 
+    colIndex <- which(colnames(annotations_per_outcome) == i)
+    colnames(annotations_per_outcome)[colIndex] <- "outcome_var"
+    annotations_per_outcome <- annotations_per_outcome[!is.na(annotations_per_outcome$outcome_var), ]
+    countMatrix_per_outcome <- countMatrix[,colnames(countMatrix) %in% row.names(annotations_per_outcome)]
+    meta_dds2[[i]]$dds <-  DESeqDataSetFromMatrix(
+                                  countData = countMatrix_per_outcome,
+                                  colData = annotations_per_outcome,
+                                  design = ~ Batch + outcome_var )
+}
+
+for(i in names(meta_dds2)){
+  print(i)
+  dds <- meta_dds2[[i]]$dds
+  keep <- rowSums(counts(dds)) >= 10  # discard genes with less than 10 reads: low quality filtering
+  dds <- dds[keep,]
+  dds <- DESeq(dds)
+  meta_dds2[[i]]$dds <- dds
+  meta_dds2[[i]]$rld <- rlog(dds, blind = FALSE)
+  meta_dds2[[i]]$res <- results(dds)
+}
+
+for(i in selected_outcomes3){
+  meta_dds2[[i]]$res <- results(meta_dds2[[i]]$dds, contrast=c("outcome_var","high","low"))
+}
+
+for(i in names(meta_dds2)){
+  sig <- meta_dds2[[i]]$res
+  sig <- sig[!is.na(sig$pvalue),]
+  sig <- sig[sig$pvalue < 0.05,]
+  meta_dds2[[i]]$sig <- sig
+}
+
+
+meta_dds_unsup <- list()
+for(i in outcomes_unsup ){
+    annotations_per_outcome <-  merged_annotations_caprion_filt 
+    colIndex <- which(colnames(annotations_per_outcome) == i)
+    colnames(annotations_per_outcome)[colIndex] <- "outcome_var"
+    annotations_per_outcome <- annotations_per_outcome[!is.na(annotations_per_outcome$outcome_var), ]
+    countMatrix_per_outcome <- countMatrix[,colnames(countMatrix) %in% row.names(annotations_per_outcome)]
+    meta_dds_unsup[[i]]$dds <-  DESeqDataSetFromMatrix(
+                                  countData = countMatrix_per_outcome,
+                                  colData = annotations_per_outcome,
+                                  design = ~ Batch + outcome_var )
+}
+
+for(i in names(meta_dds_unsup)){
+  print(i)
+  dds <- meta_dds_unsup[[i]]$dds
+  keep <- rowSums(counts(dds)) >= 10  # discard genes with less than 10 reads: low quality filtering
+  dds <- dds[keep,]
+  dds <- DESeq(dds)
+  meta_dds_unsup[[i]]$dds <- dds
+  meta_dds_unsup[[i]]$rld <- rlog(dds, blind = FALSE)
+  meta_dds_unsup[[i]]$res <- results(dds)
+}
+
+for(i in outcomes_unsup){
+  meta_dds_unsup[[i]]$res[["Multivalent_vs_Oligovalent"]] <- results(meta_dds_unsup[[i]]$dds,
+                                                                     contrast=c("outcome_var","Multivalent","Oligovalent"))
+  meta_dds_unsup[[i]]$res[["Multivalent_vs_Intermediate"]] <- results(meta_dds_unsup[[i]]$dds,
+                                                                     contrast=c("outcome_var","Multivalent","Intermediate"))
+  meta_dds_unsup[[i]]$res[["Intermediate_vs_Oligovalent"]] <- results(meta_dds_unsup[[i]]$dds,
+                                                                     contrast=c("outcome_var","Intermediate","Oligovalent"))
+}
+
+for(i in outcomes_unsup){
+  meta_dds_unsup[[i]]$sig[["Multivalent_vs_Oligovalent"]] <- meta_dds_unsup[[i]]$res[["Multivalent_vs_Oligovalent"]] %>%
+                                                              as.data.frame(.) %>%
+                                                              filter(!is.na(pvalue)) %>%
+                                                              filter(pvalue < 0.05) %>%
+                                                              summarise(up = sum(log2FoldChange > 0),
+                                                                        dn = sum(log2FoldChange < 0) )
+                                                              
+  meta_dds_unsup[[i]]$sig[["Multivalent_vs_Intermediate"]] <- meta_dds_unsup[[i]]$res[["Multivalent_vs_Intermediate"]] %>%
+                                                              as.data.frame(.) %>%
+                                                              filter(!is.na(pvalue)) %>%
+                                                              filter(pvalue < 0.05) %>%
+                                                              summarise(up = sum(log2FoldChange > 0),
+                                                                        dn = sum(log2FoldChange < 0) )
+  meta_dds_unsup[[i]]$sig[["Intermediate_vs_Oligovalent"]] <- meta_dds_unsup[[i]]$res[["Intermediate_vs_Oligovalent"]] %>%
+                                                              as.data.frame(.) %>%         
+                                                              filter(!is.na(pvalue)) %>%
+                                                              filter(pvalue < 0.05) %>%
+                                                              summarise(up = sum(log2FoldChange > 0),
+                                                                        dn = sum(log2FoldChange < 0) )
+}
+
+for(i in names(meta_dds_unsup)){
+  for(j in meta_dds_unsup[[i]]$res)
+  sig <- meta_dds2[[i]]$res
+  sig <- sig[!is.na(sig$pvalue),]
+  sig <- sig[sig$pvalue < 0.05,]
+  meta_dds2[[i]]$sig <- sig
+}
+
+deg_table_breadth <- meta_dds2$Cumulative_Breadth_dichot$sig %>%
+                            as.data.frame(.) %>%
+                            summarise(up = sum(log2FoldChange > 0),
+                             dn = sum(log2FoldChange < 0) )
+
+
+```
+
+```{r meta_dds save}
+meta_dds_save <- meta_dds
+
+
+saveRDS(object =  meta_dds,
+        file = "output/DV_eset_collection.RDS" )
+
+saveRDS(object =  meta_dds2,
+        file = "output/DV_eset_collection_upd_outcomes_20190508.RDS" )
+
+saveRDS(object =  meta_dds_unsup,
+        file = "output/DV_eset_collection_unsupervised_clustering.RDS" )
+
+```
+
+``` {r PCA_deseq}
+deseq_PCA <- function(rld, patient_annotation, colorfactor, shapefactor) {
+  prcomp_df <- prcomp(t(rld))
+  eigs <- prcomp_df$sdev^2
+  var1 <- round((eigs[1] / sum(eigs)) * 100,2)
+  var2 <- round((eigs[2] / sum(eigs)) * 100,2)
+  patient_annotation_upd <- patient_annotation %>% as.data.frame(.) %>% rownames_to_column("filename")
+  print(var1)
+  print(var2)
+   
+  prcomp_df_annot <- prcomp_df$x %>%
+                      as.data.frame(.) %>%
+                      rownames_to_column("filename") %>%
+                      inner_join(patient_annotation_upd , by = "filename")
+  common_samples <- prcomp_df_annot %>%
+                  group_by(PID) %>%
+                  mutate(n_samples = n() ) %>%
+                  ungroup(.) %>%
+                  arrange(PID) %>%
+                  filter(n_samples > 1)
+  common_samples <- common_samples[c(1:4),]
+ 
+  print(common_samples)                  
+  p <- ggplot(prcomp_df_annot, aes_string("PC1", "PC2", color=colorfactor, shapefactor)) +
+           geom_point(size=3)  +
+           xlab(paste0("PC1: ",var1,"% variance")) +
+           ylab(paste0("PC2: ",var2,"% variance")) +
+           coord_fixed() + 
+           geom_label_repel(aes(label = PID), data = common_samples)
+  return(p)
+}
+
+
+pca <- deseq_PCA(as.data.frame(assay(meta_dds$DV1_AUCp_log$rld)), 
+                               patient_annotation = merged_annotations_filt,
+                               color = "Batch", shape = "Batch")
+
+ggsave(file.path(figureDir, "PCA_DV1_prebatch_correction.pdf"), pca, device = "pdf")
+
+
+# combat_colData <- colData(meta_dds$DV1_AUCp_log$dds) %>%
+#                     as.data.frame(.) %>% 
+#                     rownames_to_column("filename") %>%
+#                     dplyr::mutate(PID = factor(PID)) %>%
+#                     column_to_rownames("filename")
+modcombat = model.matrix(~as.factor(PID), data=colData(meta_dds$DV1_AUCp_log$dds))
+# combat_corr<-as.data.frame(ComBat(as.matrix(assay(meta_dds$DV1_AUCp_log$rld)), 
+#                       batch = colData(meta_dds$DV1_AUCp_log$dds)$Batch),
+#                       modcombat = modcombat)
+
+combat_corr<-as.data.frame(ComBat(as.matrix(assay(meta_dds2$DV1_AUCp_log$rld)), 
+                      batch = colData(meta_dds$DV1_AUCp_log$dds)$Batch),
+                      modcombat = modcombat)
+
+pca_corr <- deseq_PCA(combat_corr, 
+                               patient_annotation = merged_annotations_filt,
+                               color = "Batch", shape = "Batch")
+ggsave(file.path(figureDir, "PCA_DV1_postbatch_correction.pdf"), pca_corr, device = "pdf")
+
+
+# norm_edata_merged <- normalize.quantiles(as.matrix(as.data.frame(merged_expr_st_immgen),rownames.force = TRUE))
+# dimnames(norm_edata_merged) <- list(row.names(merged_expr_st_immgen), colnames(merged_expr_st_immgen))
+# plotDensity(assay(meta_dds$DV1_AUCp_log$rld))
+
+
+
+
+
+print(pca)
+ggsave(pca, filename=file.path(diagOutDir,"PCA_plot_QC.pdf"), device = "pdf")
+print(pca)
+
+
+
+```
+
+
+```{r DEG_hm}
+
+DEG_heatmap_mat <- function(deseq_object_sig, contrast ,geneIds, combatCorr){
+    res <- deseq_object_sig %>%
+            as.data.frame() %>%
+            rownames_to_column("ensembl_gene_id") %>%
+            inner_join(., geneIds, by = "ensembl_gene_id") %>%
+            filter(hgnc_symbol != "") #%>%
+       
+    annot_outcome <- outcome_df %>%
+                    gather(outcome, outcome_val, c(5:10)) %>%
+                    filter(outcome == contrast) %>%
+                    filter(!is.na(outcome_val)) %>%
+                    #arrange(outcome_val) %>%
+                    spread(outcome, outcome_val) %>%
+                    column_to_rownames("PID")
+    annot_outcome <- annot_outcome[order(annot_outcome[contrast]),]
+    print(annot_outcome)
+    
+    mat <- combat_corr_filt %>%
+                ungroup() %>%
+                filter(hgnc_symbol %in% res$hgnc_symbol) %>%
+                dplyr::select(-EnsID) %>%
+                column_to_rownames("hgnc_symbol") %>%
+                as.matrix(.)
+    filt_ids <- row.names(annot_outcome)[row.names(annot_outcome) %in% colnames(mat)]
+    #print(mat)
+    mat <- mat[, filt_ids]
+            
+    
+   return(mat)
+}
+
+DEG_heatmap <- function(DEG_mat, showGenes = FALSE, annotation_df, outcome){
+  mat <- DEG_mat
+
+      
+  #paletteLength <- 500
+  
+  
+  combat_corr_DEGS <- t(scale(t(mat)))
+  colorLS <- colorAssign(combat_corr_DEGS, colors = c("blue", "white", "#FF0000"), 
+                         length.vector = 100)
+  #topScale <- max(abs(combat_corr_DEGS))
+  #myBreaks <- seq(-topScale, topScale, length.out=paletteLength)
+  annot_df <- annotation_df %>% 
+              column_to_rownames("PID")
+  pheatmap_DEGS <- pheatmap(mat = combat_corr_DEGS,
+                            #scale = "row",
+                            color = colorLS,
+                            #breaks = myBreaks,
+                            show_rownames = showGenes,
+                            show_colnames = FALSE,
+                            treeheight_row = 8,
+                            cluster_cols = FALSE,
+                            # treeheight_col = 8,
+                            cellwidth = 3,
+                            cellheight = 0.25,
+                            fontsize = 6,
+                            annotation_col = annot_df[outcome],
+                            filename = file.path(figureDir,paste(outcome, "_HM_DEG.pdf", 
+                                                                 sep = "")))
+
+  
+}
+
+
+DEG_barplot <- sapply(names(meta_dds2), simplify = F, USE.NAMES = T, function(x){
+  df <- meta_dds2[[x]]$sig %>%
+                as.data.frame(.) %>%
+                rownames_to_column("ensembl_gene_id") %>%
+                inner_join(., all_ids, by = "ensembl_gene_id") %>%
+                filter(hgnc_symbol != "") %>%
+                filter(pvalue <0.05) %>%
+                mutate(direction = ifelse(log2FoldChange >0 , "Pos", "Neg")) %>%
+                group_by(direction) %>%
+                dplyr::summarize(ngenes = n_distinct(hgnc_symbol)) 
+  p <- ggplot(df, aes(x = direction, y = ngenes, fill = direction)) +
+        geom_bar(stat = "identity", aes(label=ngenes)) +
+        theme_bw()
+  return(list("df" = df, "plot" = p))
+  
+})  
+
+ggsave(DEG_barplot$Cumulative_Breadth_dichot$plot, filename = "output/figures/Breadth_DEG_barplot.pdf", height = 5.5, width = 4)
+
+DEG_mat <- sapply(names(meta_dds2), simplify = F, USE.NAMES = T, function(x){
+   mat <- DEG_heatmap_mat(deseq_object = meta_dds2[[x]]$sig, 
+                    geneIds = all_ids, 
+                    combatCorr = combat_corr_filt,
+                    contrast = x )
+   return(mat)
+})
+
+DEG_LS <- sapply(names(meta_dds2), simplify = F, USE.NAMES = T, function(x){
+   mat <- DEG_heatmap_mat(deseq_object = meta_dds2[[x]]$sig, 
+                    geneIds = all_ids, 
+                    combatCorr = combat_corr_filt,
+                    contrast = x )
+   return(mat)
+})
+
+DEG_hm_outcomes <- sapply(names(DEG_mat), simplify = F, USE.NAMES = T, function(x){
+  outcome_fig <- gsub("Cumulative_Breadth_dichot", "Breadth", x)
+  outcome_df_fig <- outcome_df
+  colnames(outcome_df_fig) <- gsub("Cumulative_Breadth_dichot", "Breadth",
+                                   colnames(outcome_df_fig))
+  DEG_mat_rev <- DEG_mat[[x]]
+  DEG_mat_rev <- DEG_mat_rev[,rev(colnames(DEG_mat_rev))]
+  
+  hm <- DEG_heatmap(DEG_mat = DEG_mat_rev,
+                     annotation_df = outcome_df_fig,
+                     outcome = outcome_fig)
+  return(hm)
+})
+
+
+
+DEG_mat_filt <- DEG_mat[!grepl("D91",names(DEG_mat))]
+names(DEG_mat_filt) <- gsub("_log", "", names(DEG_mat_filt))
+names(DEG_mat_filt) <- gsub("Cumulative_", "", names(DEG_mat_filt))
+names(DEG_mat_filt) <- gsub("_dichot", "", names(DEG_mat_filt))
+pw_combn <- combn(names(DEG_mat_filt),m = 2, simplify = F)
+pw_jaccard <- do.call("rbind", lapply(pw_combn, function(x){
+      genes1 <- row.names(DEG_mat_filt[[x[1]]])
+      genes2 <- row.names(DEG_mat_filt[[x[2]]])
+      uni <- unique(union(genes1, genes2))
+      inters <- intersect(genes1, genes2)
+      jacc <- length(inters) / length(uni)
+      df <- data.frame("source" = x[1], "target" = x[2], "jaccard_index" = jacc,
+                       "n_genes_intersect" = length(inters), 
+                       "n_genes1__2" = paste(length(genes1), length(genes2), sep ="__") )
+      return(df)
+}))
+
+write.table(pw_jaccard, "output/data/DEG_jaccard_network_Table.txt",quote = F, sep = "\t",row.names = F)
+
+jaccard_nodes <- do.call("rbind", lapply(names(DEG_mat_filt), function(x){
+  df <- data.frame("node" = x, size =  length(unique(row.names(DEG_mat_filt[[x]]))))
+  return(df)
+}))
+
+write.table(jaccard_nodes, "output/data/DEG_jaccard_node_Table.txt",quote = F, sep = "\t",row.names = F)
+
+
+pw_jaccard_breadth <- do.call("rbind", lapply(pw_combn, function(x){
+      genes1 <- row.names(DEG_mat_filt[[x[1]]]) 
+      genes1 <- genes1[genes1 %in% row.names(DEG_mat$Cumulative_Breadth_dichot)]
+      genes2 <- row.names(DEG_mat_filt[[x[2]]])
+      genes2 <- genes2[genes2 %in% row.names(DEG_mat$Cumulative_Breadth_dichot)]
+      uni <- unique(union(genes1, genes2))
+      inters <- intersect(genes1, genes2)
+      jacc <- length(inters) / length(uni)
+      df <- data.frame("source" = x[1], "target" = x[2], "jaccard_index" = jacc)
+      return(df)
+})) %>%
+  filter(!grepl("Breadth", source)) %>%
+  filter(!grepl("Breadth", target)) 
+
+
+
+
+
+
+```
+
+
+```{r upset_deg}
+
+DEG_LS <- sapply(names(meta_dds2)[c(1:4, 6)], simplify = F, USE.NAMES = T, function(x){
+    df <- meta_dds2[[x]]$sig %>%
+        as.data.frame() %>%
+        rownames_to_column("ensembl_gene_id") %>%
+        inner_join(., all_ids, by = "ensembl_gene_id") %>%
+        filter(hgnc_symbol != "") %>%
+        .$hgnc_symbol %>% unique()
+   return(df)
+})
+DEG_LS$Breadth <- DEG_LS$Cumulative_Breadth_dichot
+DEG_LS$Cumulative_Breadth_dichot <- NULL
+names(DEG_LS) <- gsub("_AUC.*", "", names(DEG_LS))
+
+upset_comb <- make_comb_mat(DEG_LS, mode = "intersect")
+
+comb_order_df <- cbind(as.data.frame(comb_size(upset_comb)), as.data.frame(comb_degree(upset_comb))) %>%
+                  rownames_to_column("combination") %>%
+                  dplyr::filter(grepl("1$", combination)) %>%
+                  dplyr::rename(size = 2,
+                                degree = 3) %>%
+                  dplyr::filter(degree == 2 ) %>%
+                  mutate(rank = row_number()) %>%
+                  arrange( degree, desc(size))
+                  #arrange(desc(size), degree)
+
+upset_comb_filt <- upset_comb[comb_name(upset_comb) %in% comb_order_df$combination]
+
+upset_dv_response <- UpSet(upset_comb_filt,
+              comb_order = comb_order_df$rank,
+              set_order = names(DEG_LS)[c(5,1:4)],
+              #top_annotation = upset_top_annotation(upset_comb, add_numbers = T),
+              top_annotation = upset_top_annotation(upset_comb_filt, add_numbers = T),
+              right_annotation = upset_right_annotation(upset_comb_filt, add_numbers = T))#,
+              #comb_col = c("blue", "purple", "red", "black")[comb_degree(upset_comb_filt)])
+
+svg("output/figures/upset_plot_response_deg.svg", width = 7, height = 4)
+draw(upset_dv_response, ht_gap = unit(7, "mm"))
+dev.off()
+
+comb_order_df_full <- cbind(as.data.frame(comb_size(upset_comb)), as.data.frame(comb_degree(upset_comb))) %>%
+                  rownames_to_column("combination") %>%
+                  dplyr::filter(grepl("1$", combination)) %>%
+                  dplyr::rename(size = 2,
+                                degree = 3) %>%
+                  dplyr::filter(degree > 1 & degree < 5 ) %>%
+                  mutate(rank = row_number()) %>%
+                  arrange( degree, desc(size))
+                  #arrange(desc(size), degree)
+
+
+
+upset_comb_full_filt <- upset_comb[comb_name(upset_comb) %in% comb_order_df_full$combination]
+
+upset_dv_response_full <- UpSet(upset_comb_full_filt,
+              comb_order = comb_order_df_full$rank,
+              set_order = names(DEG_LS)[c(5,1:4)],
+              #top_annotation = upset_top_annotation(upset_comb, add_numbers = T),
+              top_annotation = upset_top_annotation(upset_comb_full_filt, add_numbers = T),
+              right_annotation = upset_right_annotation(upset_comb_full_filt, add_numbers = T),
+              comb_col = c("blue", "purple", "red", "black")[comb_degree(upset_comb_full_filt)])
+
+upset_lgd <- list(Legend(at = sort(unique(comb_degree(upset_comb_full_filt)), decreasing = F), title = "Degrees",
+                                        legend_gp = gpar(fill = c("purple", "red", "black"))))
+# 
+svg("output/figures/upset_plot_response_full.svg", width = 10, height = 4)
+draw(upset_dv_response_full, ht_gap = unit(7, "mm"), annotation_legend_list = upset_lgd)
+dev.off()
+
+
+```
+
+
+```{r venn_DEGS}
+venn_list <- sapply(names(DEG_mat), simplify = F,USE.NAMES = T, function(x){
+  genes <- DEG_mat[[x]] %>% as.data.frame() %>% 
+    rownames_to_column("genes") %>% 
+    filter(genes %in% row.names(DEG_mat$Cumulative_Breadth_dichot)) %>%
+    .$genes
+  return(genes)
+})
+venn_list <- venn_list[!grepl("Breadth", names(venn_list))]
+names(venn_list) <- gsub("_log", "", names(venn_list))
+
+library(VennDiagram)
+library(RColorBrewer)
+venn.diagram(venn_list, filename = "output/figures/venn_DEGS.tiff", 
+             fill = brewer.pal(8, "Dark2")[c(1:4)], alpha = 0.5, cat.col = brewer.pal(8, "Dark2")[c(1:4)], 
+             res = 300, width = 1500, height = 900)
+
+
+```
+
+
+
+```{r fgsea_func}
+
+
+fgsea_function <- function(x,gmtfile, method = "shLFC", p_thr = 0.05, n.perm = 10000, maxSize = 5000, minSize = 15) {
+  ###function to do preranked geneset enrichment using fgsea using a given 1.srunken deseq input and 2.gmt file path
+  if(!method %in% c("shLFC","logp", "regression")){
+    stop("Invalid method for fgsea_function. Options are 'shLFC' or 'logp'")
+  }
+  shrunk_deseq_output <- x
+  shrunk_deseq_output <- shrunk_deseq_output[!is.na(shrunk_deseq_output$padj),]
+  if( method == "shLFC"){
+      shrunk_deseq_output <- shrunk_deseq_output[order(-shrunk_deseq_output$log2FoldChange),] 
+      ranks <- shrunk_deseq_output
+      ranks_set <- setNames(ranks$log2FoldChange, row.names(ranks))
+  } else if(method == "logp") {
+      shrunk_deseq_output$rank_metric <- sign(shrunk_deseq_output$log2FoldChange) *   -log(shrunk_deseq_output$pvalue)
+      shrunk_deseq_output <- shrunk_deseq_output[order(-shrunk_deseq_output$rank_metric),] 
+      ranks <- shrunk_deseq_output
+      ranks_set <- setNames(ranks$rank_metric, row.names(ranks))
+  } else if(method == "regression") {
+    shrunk_deseq_output$rank_metric <- sign(shrunk_deseq_output$log2FoldChange) *   -log(shrunk_deseq_output$pvalue)
+      shrunk_deseq_output <- shrunk_deseq_output[order(-shrunk_deseq_output$rank_metric),] 
+      ranks <- shrunk_deseq_output
+      ranks_set <- setNames(ranks$rank_metric, row.names(ranks))
+  }
+  pathways <- gmtPathways(gmtfile)
+  fgseaRes<-fgsea(pathways,ranks_set,minSize=minSize,maxSize=maxSize,nperm=n.perm)
+  fgseaRes<- fgseaRes[fgseaRes$pval <=p_thr,]
+  fgseaRes<-fgseaRes[order(fgseaRes$padj),]
+  fgseaRes<-fgseaRes[!is.na(fgseaRes$padj),]
+  return(fgseaRes)
+}
+
+fgsea_output <- function(fgsea_vector,
+                         eset_contrast,
+                         outcome,
+                         geneset_list,
+                         geneset,
+                         fileDir,
+                         method = "shLFC",
+                         p_thr = 0.05, 
+                         maxSize = 5000,
+                         minSize = 15) {
+  if(length(fgsea_vector[[outcome]]) == 0) {
+    fgsea_list <- list()
+  } else {
+    fgsea_list <- fgsea_vector[[outcome]]
+  }
+  fgsea_list[[geneset]]$geneset_file <- geneset_list[[geneset]]
+  fgsea_list[[geneset]]$output <- fgsea_function(eset_contrast, 
+                                                 geneset_list[[geneset]], 
+                                                 method = method, 
+                                                 p_thr = p_thr,
+                                                 maxSize = maxSize,
+                                                 minSize = minSize)
+  write.csv(as.data.frame(fgsea_list[[geneset]]$output[,c(1:7)]), 
+          file=file.path(fileDir,paste(outcome,geneset,method,"gsea.csv", sep="_")), 
+          quote = FALSE)
+  fgsea_vector[[outcome]] <- fgsea_list
+  return(fgsea_vector)
+}
+
+```
+
+
+```{r unsupervised_clust_DEGS}
+unsup_extreme_degs <- sapply(names(meta_dds_unsup$Polyvalence$res)[c(7:9)], USE.NAMES = T, simplify = F, function(x){
+      df <- meta_dds_unsup$Polyvalence$res[[x]] %>%
+                      as.data.frame(.) %>%
+                      rownames_to_column("EnsID") %>%
+                      filter(pvalue < 0.05 )
+      return(df)
+})
+
+unsup_extreme_degs <- meta_dds_unsup$Polyvalence$res$Multivalent_vs_Oligovalent %>%
+                    as.data.frame(.) %>%
+                    rownames_to_column("EnsID") %>%
+                    filter(pvalue < 0.05 )
+
+
+unsup_combat_corr_filt <- sapply(names(unsup_extreme_degs), USE.NAMES = T, simplify = F, function(x){
+  conditions <- str_split(x, pattern = "_vs_")[[1]]
+  hm_select <- merged_annotations_caprion_filt %>%
+              rownames_to_column("sample_id") %>%
+              filter(Polyvalence %in%  conditions) %>%
+              column_to_rownames("sample_id")
+  filt <- combat_corr[row.names(combat_corr) %in% unsup_extreme_degs[[x]]$EnsID,]
+  filt <- filt [,colnames(filt ) %in% row.names(hm_select)]
+  return(filt)
+})
+
+
+
+ colorLS <- colorRampPalette(colors = c("blue","white", "red"))(500)
+  topScale <- max(abs(min(df)),abs(max(df)))
+  myBreaks <- seq(-topScale, topScale, length.out=paletteLength)
+
+unsup_hm <- sapply(names(unsup_combat_corr_filt), USE.NAMES = T, simplify = F, function(x){
+  filename <- file.path(figureDir,paste("heatmap_transcriptomic_unsupervised_clust_", x, ".pdf", sep = ""))
+  colorLS <- colorRampPalette(colors = c("blue","white", "red"))(500)
+  mat <- unsup_combat_corr_filt[[x]]
+  topScale <- max(abs(min(mat)),abs(max(mat)))
+  myBreaks <- seq(-topScale, topScale, length.out=paletteLength)
+  hm <- pheatmap(mat,
+                     annotation_col = merged_annotations_caprion_filt["Polyvalence"],
+                     show_colnames = F,
+                     show_rownames = F,
+                     scale = "row",
+                     color = colorLS,
+                     filename = filename)
+})
+  
+
+
+
+
+
+
+
+
+```
+
+
+```{r }
+
+
+GSEA_data_Dir <- setup_dir(file.path(dataOutDir,"gsea"))
+
+geneset_list <- list(c5 = file.path(genesetsDir,
+                                        "c5.go.bp.v7.2.symbols.gmt"),
+                     c2 = file.path(genesetsDir,
+                                        "c2.all.v7.2.symbols.gmt"),
+                     c7 = file.path(genesetsDir,
+                                        "c7.all.v7.2.symbols.gmt"),
+                     hallmark = file.path(genesetsDir,
+                                        "h.all.v7.2.symbols.gmt"),
+                     c3 = file.path(genesetsDir,
+                                        "c3.all.v7.2.symbols.gmt"),
+                     transfac = file.path(genesetsDir,
+                                        "TRANSFAC.gmt"),
+                     jasper = file.path(genesetsDir,
+                                        "JASPER-tf.gmt"),
+                     CHEA = file.path(genesetsDir,
+                                        "CHEA-tf.gmt"),
+                     HMDB = file.path(genesetsDir,
+                                        "HMDBpathways.gmt"),
+                     smpdb = file.path(genesetsDir,
+                                        "smpdb_clean.gmt"),
+                     interferome = file.path(genesetsDir,
+                                        "interferome.isg.gmt"),
+                      inflammasome = file.path(genesetsDir,
+                                        "inflammasome_collection.gmt")
+                     )
+geneset_list2 <-  list(inflammasome = file.path(genesetsDir,
+                                        "inflammasome_collection.gmt")
+                     )
+
+
+# meta_dds_fgsea <- meta_dds
+# meta_dds_fgsea <- meta_dds_fgsea[!names(meta_dds_fgsea) %in% c("DV1_AUCp","DV2_AUCp",
+#                                                                "DV3_AUCp", "DV4_AUCp" )]
+
+meta_dds_fgsea2 <- meta_dds2
+meta_dds_fgsea2 <- meta_dds_fgsea2[!names(meta_dds_fgsea2) %in% c("DV1_AUCp","DV2_AUCp",
+                                                               "DV3_AUCp", "DV4_AUCp" )]
+
+fgsea_analysis2 <- list()
+
+for(i in names(meta_dds2)){
+  for(j in names(geneset_list)) {
+    maxSize <- 500
+    minSize <- 15
+    if(j %in% c("CHEA", "transfac", "JASPER", "c3")){
+      maxSize <- 5000
+    } 
+    if(j %in% c("smpdb", "HMDB")){
+      minSize <- 5
+    }
+    topTable <- meta_dds2[[i]]$res %>%
+                  as.data.frame() %>%
+                  rownames_to_column('ensembl_gene_id') %>%
+                  inner_join(., all_ids, by = "ensembl_gene_id") %>%
+                  group_by(hgnc_symbol) %>%
+                  mutate(top = ifelse(max(baseMean) == baseMean, 1, 0)) %>%
+                  ungroup() %>%
+                  filter(top == 1 ) %>%
+                  dplyr::select(-ensembl_gene_id) %>%
+                  column_to_rownames("hgnc_symbol") 
+                  
+                  
+    fgsea_analysis2 <- fgsea_output(fgsea_analysis2,
+                               eset_contrast = topTable,
+                               outcome = i,
+                               geneset_list = geneset_list,
+                               geneset = j,
+                               fileDir = GSEA_data_Dir,
+                               p_thr = 0.1,
+                               method = "logp",
+                               minSize = minSize,
+                               maxSize = maxSize)
+    if(dim(fgsea_analysis2[[i]][[j]]$output)[1] >0){
+      print(c(i,j,dim(fgsea_analysis2[[i]][[j]]$output)[1]))
+    }
+  }
+}
+
+
+geneset_tonic <- list("tonic" = "output/data/tonic_IFNs.gmt")
+fgsea_tonic <- list()
+
+
+for(i in names(meta_dds2)){
+  
+    maxSize <- 500
+    minSize <- 10
+    topTable <- meta_dds2[[i]]$res %>%
+                  as.data.frame() %>%
+                  rownames_to_column('ensembl_gene_id') %>%
+                  inner_join(., all_ids, by = "ensembl_gene_id") %>%
+                  group_by(hgnc_symbol) %>%
+                  mutate(top = ifelse(max(baseMean) == baseMean, 1, 0)) %>%
+                  ungroup() %>%
+                  filter(top == 1 ) %>%
+                  dplyr::select(-ensembl_gene_id) %>%
+                  column_to_rownames("hgnc_symbol") 
+                  
+                  
+    fgsea_tonic <- fgsea_output(fgsea_tonic,
+                               eset_contrast = topTable,
+                               outcome = i,
+                               geneset_list = geneset_tonic,
+                               geneset = "tonic",
+                               fileDir = GSEA_data_Dir,
+                               p_thr = 0.1,
+                               method = "logp",
+                               minSize = minSize,
+                               maxSize = maxSize)
+    if(dim(fgsea_tonic[[i]][["tonic"]]$output)[1] >0){
+      print(c(i,"tonic",dim(fgsea_tonic[[i]][["tonic"]]$output)[1]))
+    
+  }
+}
+
+
+
+
+
+fgsea_consolidated <- do.call('rbind', lapply(names(fgsea_analysis2), function(x){
+            out  <-    do.call('rbind', lapply(names(fgsea_analysis2[[x]]), function(y){
+                    df <- fgsea_analysis2[[x]][[y]]$output %>%
+                            as.data.frame() %>%
+                            mutate(outcome = x,
+                                   genesetColl = y) %>%
+                            unnest(cols = "leadingEdge") %>%
+                            group_by(pathway) %>%
+                            mutate(temp = paste(leadingEdge, collapse = "; ")) %>%
+                            ungroup() %>%
+                            dplyr::select(-leadingEdge) %>%
+                            dplyr::rename(leadingEdge = "temp") %>%
+                            unique()
+                    return(df)
+                  }))
+          return(out)        
+})) %>%
+  split(., f = .$outcome)
+
+
+
+cumul_breadth_enMap  <- compute_modules_func_ledge(fgsea_consolidated$Cumulative_Breadth_dichot, 
+                           p_threshold = 0.05,
+                            jaccard_threshold = 0.375,
+                           filename = file.path(dataOutDir, "cumul_breadth_enMap.tsv"),
+                          p_integration_method = "minp")
+
+
+
+breadth_pathway_subset <- fgsea_consolidated$Cumulative_Breadth_dichot %>%
+                            filter(pval < 0.05) %>%
+                            .$pathway
+breadth_pathway_summary_stats <- fgsea_consolidated$Cumulative_Breadth_dichot %>%
+                            filter(pval < 0.05) %>%
+                            #filter(padj <0.05) %>%
+                            mutate(dir = ifelse(sign(NES) == 1, "UP", "DN")) %>%
+                            group_by(dir) %>%
+                            summarise(n_path = n_distinct(pathway))
+
+DV1_enMap  <- compute_modules_func_ledge(fgsea_consolidated$DV1_AUCp_log, 
+                           p_threshold = 0.05,
+                            jaccard_threshold = 0.375,
+                           filename = file.path(dataOutDir, "DV1_enMap.tsv"),
+                          p_integration_method = "minp")
+
+
+DV3_enMap  <- compute_modules_func_ledge(fgsea_consolidated$DV3_AUCp_log %>%
+                                           filter(pathway %in% breadth_pathway_subset), 
+                           p_threshold = 0.05,
+                            jaccard_threshold = 0.375,
+                           filename = file.path(dataOutDir, "DV3_enMap.tsv"),
+                          p_integration_method = "minp")
+
+
+module_table_breadth <- read_tsv(file.path(dataOutDir, "cumul_breadth_enMap_annot.txt")) %>%
+          filter(!is.na(module_newName)) %>%
+          arrange(desc(abs(NES))) %>%
+          mutate(module_merged = gsub(' #.*', '', module_newName)) %>%
+          group_by(module_merged) %>%
+          mutate(minp = sign(logp) * -log(min(pval_int))) %>%
+          ungroup() %>%
+          mutate(rank  = dense_rank(minp)) %>%
+          arrange(desc(rank)) %>%
+          dplyr::rename(leadingEdge = 'genes',
+                        pathway = 'module_newName')
+
+
+
+module_split <- split(module_table_breadth, f = module_table_breadth$Category)
+
+write.table(module_split$Immune, file = "output/immune_transcriptomics_modules_breadth.txt", 
+            sep = "\t", row.names = F, quote = F )
+          
+gsva_matr <- gsva_func(module_table_breadth, sep = ', ', 
+                       exprs = combat_corr_filt %>%
+                       dplyr::select(-EnsID) %>% 
+                         column_to_rownames('hgnc_symbol') %>%
+                          as.matrix())
+
+
+write_tsv(as.data.frame(gsva_matr) %>% rownames_to_column("row"), path  = 'output/data/transc_gsva_matrix.txt')
+
+test <- read_tsv('output/data/transc_gsva_matrix.txt')
+
+module_sero_corr <- as.data.frame(gsva_matr) %>%
+                      rownames_to_column("pathway") %>%
+                      gather(PID, zscore, -pathway) %>%
+                      inner_join(., outcome_df, by = "PID") %>%
+                      dplyr::select(PID, pathway,zscore,
+                                    DV1_AUCp_log,DV2_AUCp_log,
+                                    DV3_AUCp_log, DV4_AUCp_log) %>%
+                      gather(serotype, auc, -PID, -pathway, -zscore) %>%
+                      group_by(pathway, serotype) %>%
+                      do(model = cor.test(.$zscore, .$auc, method = 'spearman')) %>%
+                      tidy(., model) %>%
+                      ungroup() %>%
+                      mutate(logp = ifelse(p.value > 0.05, 0, sign(estimate) *-log(p.value))) %>%
+                      mutate(serotype = gsub("_AUC.*", '', serotype)) %>%
+                      mutate(serotype = paste(serotype, "logp", sep = '_')) %>%
+                      dplyr::select(pathway, logp, serotype) %>%
+                      spread(serotype, logp) %>%
+                      inner_join(., module_table_breadth %>% 
+                                    dplyr::select(pathway, logp) %>%
+                                    dplyr::rename(Breadth_logp = 'logp'),
+                                    by = 'pathway') %>%
+                      column_to_rownames('pathway') 
+
+module_sero_corr_P <- module_sero_corr %>%
+                      rownames_to_column("pathway") %>%
+                      gather(outcome, logp, -pathway) %>%
+                      mutate(logp = signif(exp(-abs(logp)), digits = 2)) %>%
+                      spread(outcome, logp) %>%
+                      column_to_rownames("pathway")
+                      
+
+
+write.table(module_sero_corr, file = 'output/data/gsva_outcome_metrics.txt', sep = '\t',
+            quote = F, row.names = T)
+                        
+
+
+
+colorAnnot_rows <- sapply(names(module_split), simplify = F , USE.NAMES = T, function(x){
+    out <- sapply(colnames(module_sero_corr), simplify = F, USE.NAMES = T, function(y){
+            df_filt <- module_sero_corr[row.names(module_sero_corr) %in% module_split[[x]]$pathway
+                                        ,y]
+            sig_annot_values  <-  colorAssign(df_filt, 
+                                              scale_limits = c(-max(abs(module_sero_corr)),
+                                                               max(abs(module_sero_corr))),
+                                              colors = )
+            return(sig_annot_values)
+          })
+  
+  
+})
+                      
+
+heatmap_annot_cols <- annotation_colors <- list("DV1_AUC" = c("white", "darkgreen"), 
+                                                "DV2_AUC" = c("white", "darkgreen"),
+                              "DV3_AUC" = c("white", "darkgreen"), 
+                              "DV4_AUC" = c("white", "darkgreen"),
+                              "Cumulative_Breadth_dichot" = c("high" = "#F1978C" ,
+                                                              "low" = "#63D7DE"))
+outcome_df_mod <- outcome_df %>% 
+                  gather(auc, value, colnames(outcome_df)[grepl("AUCp", colnames(outcome_df))]) %>%
+                  mutate(auc = gsub("p_log", "", auc)) %>%
+                  spread(auc, value) %>%
+                  column_to_rownames('PID')
+
+
+
+gsva_heat_split <- sapply(names(module_split),USE.NAMES = T, simplify = F , function(x){
+
+  sub_gsva <- gsva_matr[module_split[[x]]$pathway,colnames(gsva_matr) %in%
+                                                   row.names(outcome_df_mod)]
+  pos_path <- module_split[[x]] %>% filter(logp > 0) %>% .$pathway
+  pos_sub <- sub_gsva[row.names(sub_gsva) %in% pos_path, ] %>%
+              as.data.frame() %>%
+              rownames_to_column("pathway") %>%
+              gather(PID, value, -pathway) %>%
+              group_by(PID) %>%
+              summarize(mean = mean(value)) %>%
+              ungroup() %>%
+              spread(PID, mean)
+  
+  outcome_df_mod_fig <- outcome_df_mod %>%
+                        dplyr::rename(Breadth = "Cumulative_Breadth_dichot") 
+  
+  pid_order <- names(sort(rank(pos_sub)))
+  sub_gsva <- sub_gsva[,pid_order]
+  module_sero_corr_reorder <- module_sero_corr[,rev(colnames(module_sero_corr))]
+  metab_gsva <- gsva_heatmap(gsva_matr = sub_gsva ,
+                     heatmap_attributes = 
+                       list(show_colnames = F,
+                            cluster_rows = F,
+                            cluster_cols = F,
+                            #clustering_method = "complete",
+                            
+                             # annotation_col = outcome_df_mod_fig[c("Breadth",
+                             #                                   'DV1_AUC',
+                             #                                   'DV2_AUC',
+                             #                                   'DV3_AUC',
+                             #                                   'DV4_AUC')] ,
+                            annotation_col = outcome_df_mod_fig[c("Breadth")] ,
+                             annotation_colors = c(heatmap_annot_cols, colorAnnot_rows[[x]]),
+                            #annotation_colors = c(heatmap_annot_cols, colorAnnot_rows[[x]]),
+                             # annotation_row = module_sero_corr_reorder,
+                             cellheight = 8,
+                             cellwidth = 4,
+                            fontsize = 6,
+                            height = 10,
+                            filename = file.path(figureDir, paste('slea_heatmap_', x, '.pdf')))
+                     )
+  out <- list("heatmap" = metab_gsva, "serotype_corr" = module_sero_corr_reorder)
+})
+
+
+isg_gsva <- do.call("rbind", lapply(names(isg_gsColl), function(x){
+        gs <- isg_gsColl[names(isg_gsColl) == x]
+  
+            mat <- combat_corr_filt %>%
+                  dplyr::filter(hgnc_symbol %in% unlist(geneIds(gs), use.names = F)) %>%
+                  dplyr::select(-EnsID) %>%
+                  column_to_rownames("hgnc_symbol") %>%
+                  as.matrix()
+            gsva <- as.data.frame(gsva(expr = mat, gset.idx.list = gs, method = "zscore")) 
+            order_tmp <- dv3_order[dv3_order %in% colnames(gsva)]   
+            gsva <- gsva[,order_tmp]
+}))
+
+
+isg_gsva <- isg_gsva[,intersect(colnames(isg_gsva),dv3_order)]
+
+isg_outcome_prep <- isg_gsva %>%
+              as.data.frame() %>%
+              rownames_to_column("ISG_module") %>%
+              gather(PID, zscore, -ISG_module) %>%
+              bind_rows(as.data.frame(gsva_matr) %>%
+              rownames_to_column("ISG_module") %>%
+              filter(ISG_module == "Type I IFN #1") %>%
+              gather(PID, zscore, -ISG_module)) %>%
+              inner_join(., outcome_df, by = "PID") #%>%
+             
+
+# isg_breadth <- isg_outcome_prep %>%
+#                  dplyr::rename(Breadth = "Cumulative_Breadth_dichot") %>%
+#               group_by(ISG_module) %>%
+#               do(model = t.test( .$zscore ~ .$Breadth, var.equal = F)) %>%
+#               tidy(., model) %>%
+#               ungroup() %>%
+#               mutate
+
+
+isg_sero_corr <-  isg_outcome_prep %>%
+                 gather(AUC_outcome, AUC, 
+                        colnames(outcome_df)[grepl("AUCp", colnames(outcome_df))]) %>%
+              group_by(ISG_module, AUC_outcome) %>%
+              do(model = cor.test( .$zscore , .$AUC, method = "spearman")) %>%
+              tidy(., model) %>%
+              ungroup() %>%
+              mutate(logp = sign(estimate) * -log10(p.value)) %>%
+              dplyr::select(ISG_module, AUC_outcome, logp) %>%
+              filter(ISG_module %in% row.names(isg_gsva)) %>%
+              spread(AUC_outcome, logp) %>%
+              column_to_rownames("ISG_module") 
+
+
+isg_logp_color <- sapply(colnames(isg_sero_corr), simplify = F, USE.NAMES = T, function(x){
+    out <- colorAssign(isg_sero_corr[[x]], 
+                         scale_limits = c(-max(abs(isg_sero_corr)),
+                                                               max(abs(isg_sero_corr))))
+})
+
+
+
+
+isg_submodule_heatmap <- pheatmap(isg_gsva, 
+                        color = colorAssign(isg_gsva),
+                        annotation_row = isg_sero_corr[rev(colnames(isg_sero_corr))],
+                        annotation_colors = c(isg_logp_color,
+                                              list("DV1_AUC" = c("white", "darkgreen"),
+                                                   "DV2_AUC" = c("white", "darkgreen"),
+                                                   "DV3_AUC" = c("white", "darkgreen"),
+                                                   "DV4_AUC" = c("white", "darkgreen"))),
+                        annotation_col = outcome_df_mod[c("DV1_AUC", "DV2_AUC",
+                                                        "DV3_AUC", "DV4_AUC")],
+                        cellwidth = 4,
+                        cellheight = 8,
+                        fontsize = 6,
+                        cluster_cols = F,
+                        cluster_rows = F,
+                        show_colnames = F ,
+                        height = 10,
+                        
+                        filename = "output/figures/ISG_submodule_heatmap.pdf"
+                        
+                        )
+              
+
+isg_stats <- isg_breadth %>%
+              dplyr::select(ISG_)
+
+
+#write_tsv(test, file.path(dataOutDir, "cumul_breadth_enMap_annot2.txt"))
+
+
+combo_modules <- unlist(lapply(combn(module_table_breadth$pathway, m = 2, simplify = F),
+                               function(x){
+  out <- paste(x[1], x[2], sep = '__')
+  return(out)
+}))
+
+immune_metab_top_shared <- local_jaccard2(fgsea_table = module_table_breadth) %>%
+        as.data.frame() %>%
+        rownames_to_column("source") %>%
+        gather(target, jaccard, -source) %>%
+        filter(jaccard > 0) %>%
+        mutate(combo = paste(source, target, sep = '__')) %>%
+        filter(combo %in% combo_modules) 
+
+
+write_tsv(immune_metab_top_shared, path = file.path(dataOutDir,
+                                                    'network_table_transc_jaccard.txt'))
+
+immune_metab_top_shared_filt <- immune_metab_top_shared %>%
+                        filter(grepl("SMAD|ETS1|Type I IFN|RELA|E2F4|TFAP2|AP2", combo)) #%>%
+        
+
+
+write_tsv(immune_metab_top_shared_filt, path = file.path(dataOutDir,
+                                                    'network_table_transc_jaccard_filt.txt'))
+
+node_table_jacc <- immune_metab_top_shared %>%
+                    dplyr::select(-jaccard, -combo) %>%
+                    gather(node_type, node) %>%
+                    dplyr::select(-node_type) %>%
+                    unique() %>%
+                    mutate(node_type = ifelse(node %in% module_split$Immune$pathway, "immune", 
+                                              'metab')) %>%
+                    left_join(., module_table_breadth %>% 
+                                dplyr::select(pathway, logp, leadingEdge), 
+                              by = c('node' = 'pathway')) %>%
+                    separate_rows(leadingEdge, sep = ', ') %>%
+                    group_by(node) %>%
+                    mutate(gsSize = n_distinct(leadingEdge)) %>%
+                    ungroup() %>%
+                    unique() %>%
+                    group_by(node) %>%
+                    mutate(ledge = paste(leadingEdge, collapse = "; ")) %>%
+                    dplyr::select(-leadingEdge) %>%
+                    unique() %>%
+                    dplyr::rename(leadingEdge = "ledge") #%>%
+                    
+
+write_tsv(node_table_jacc, path = file.path(dataOutDir,
+                                                    'node_table_transc_jaccard.txt'))
+
+
+node_table_jacc_filt <- immune_metab_top_shared_filt %>%
+                    dplyr::select(-jaccard, -combo) %>%
+                    gather(node_type, node) %>%
+                    dplyr::select(-node_type) %>%
+                    unique() %>%
+                    mutate(node_type = ifelse(node %in% module_split$Immune$pathway, "immune", 
+                                              'metab')) %>%
+                    left_join(., module_table_breadth %>% 
+                                dplyr::select(pathway, logp, leadingEdge), 
+                              by = c('node' = 'pathway')) %>%
+                    separate_rows(leadingEdge, sep = ', ') %>%
+                    group_by(node) %>%
+                    mutate(gsSize = n_distinct(leadingEdge)) %>%
+                    ungroup() %>%
+                    dplyr::select(-leadingEdge) %>%
+                    unique()
+
+write_tsv(node_table_jacc_filt, path = file.path(dataOutDir,
+                                                    'node_table_transc_jaccard_filt.txt'))
+
+
+immune_ledge <- module_table_breadth %>%
+                  filter(pathway %in% immune_metab_top_shared$immune) %>%
+                                                      separate_rows(leadingEdge, sep = ', ') %>%
+                  #group_by(pathway) %>%
+                  filter(leadingEdge %in% (topTable_select %>% 
+                                          as.data.frame() %>%
+                                          rownames_to_column("hgnc_symbol") %>%
+                                          filter(pvalue < 0.25) %>%
+                                          .$hgnc_symbol )) %>%
+                  #summarize(n_dist = n_distinct(leadingEdge))
+                                                      .$leadingEdge
+metab_ledge <- module_table_breadth %>%
+                  filter(pathway %in% immune_metab_top_shared$metab) %>%
+                                                      separate_rows(leadingEdge, sep = ', ') %>%
+                  #group_by(pathway) %>%
+                  filter(leadingEdge %in% (topTable_select %>% 
+                                          as.data.frame() %>%
+                                          rownames_to_column("hgnc_symbol") %>%
+                                          filter(pvalue < 0.25) %>%
+                                          .$hgnc_symbol )) %>%
+                  #summarize(n_dist = n_distinct(leadingEdge))
+                                                      .$leadingEdge 
+
+network_table_shared_ledge <- module_table_breadth %>%
+                              filter(pathway %in% c(immune_metab_top_shared$metab,
+                                                             immune_metab_top_shared$immune)) %>%
+                              separate_rows(leadingEdge, sep = ', ') %>%
+                              dplyr::select(pathway, leadingEdge) %>%
+                              dplyr::rename(source = "pathway",
+                                            target = "leadingEdge") %>%
+                              mutate(value = 1) %>%
+                              mutate(source = paste(source, '_MODULE', sep = "")) %>%
+                              filter(target %in% (topTable_select %>% 
+                                          as.data.frame() %>%
+                                          rownames_to_column("hgnc_symbol") %>%
+                                          filter(pvalue < 0.25) %>%
+                                          .$hgnc_symbol )) 
+
+write_tsv(network_table_shared_ledge %>%
+            filter(target %in% node_table_shared_ledge$node), path = file.path(dataOutDir,
+                                                    'network_table_transc_shared_ledge.txt'))
+        
+node_table_shared_ledge <- network_table_shared_ledge %>%
+                            dplyr::select(source, target) %>%
+                            gather(node_type, node) %>%
+                            mutate(node_type = ifelse(node_type == 'source', "MODULE", "gene")) %>%
+                            mutate(node_name = gsub('_MODULE', '', node)) %>%
+                            mutate(node_type2 = node_type) %>%
+                            mutate(node_type2 = ifelse(node_name %in% module_split$Immune$pathway &
+                                                        node_type == "MODULE", 'immune_module', 
+                                                       node_type2)) %>%
+                            mutate(node_type2 = ifelse(node_name %in%
+                                                         module_split$Metabolism$pathway &
+                                                        node_type == "MODULE", 'metab_module', 
+                                                       node_type2)) %>%
+                            mutate(node_size = ifelse(node_type == "MODULE", "MODULE",
+                                                      'metab_gene')) %>%
+                            mutate(node_size = ifelse(node %in% immune_ledge, "immune_gene",
+                                                      node_size)) %>%
+                            mutate(node_size = ifelse(node %in% intersect(immune_ledge,
+                                                                          metab_ledge), 
+                                                      "shared_gene",
+                                                      node_size)) %>%
+                            unique() %>%
+                            filter(node_size %in%  c('shared_gene', 'MODULE')) %>%
+                            dplyr::select(node, everything()) %>%
+                            left_join(., module_table_breadth %>%
+                                          dplyr::select(pathway, logp), 
+                                      by = c('node_name' = 'pathway')) %>%
+                            #mutate(logp = ifelse(is.na(logp), 0, logp)) %>%
+                            mutate(logp = ifelse(node_type == 'gene', 0, logp))
+
+write_tsv(node_table_shared_ledge, path = file.path(dataOutDir,
+                                                    'node_table_transc_shared_ledge.txt'))
+
+
+
+
+
+
+fgsea_analysis_unsup <- list()
+for(i in names(meta_dds_unsup$Polyvalence$res)[c(7:9)]){
+  for(j in names(c(geneset_list, geneset_list2))) {
+    fgsea_analysis_unsup <- fgsea_output(fgsea_analysis_unsup,
+                               eset_contrast = meta_dds_unsup$Polyvalence$res[[i]],
+                               outcome = i,
+                               geneset_list = c(geneset_list, geneset_list2),
+                               geneset = j,
+                               fileDir = GSEA_data_Dir,
+                               p_thr = 0.1,
+                               method = "logp"
+                               )
+    if(dim(fgsea_analysis_unsup[[i]][[j]]$output)[1] >0){
+      print(c(i,j,dim(fgsea_analysis_unsup[[i]][[j]]$output)[1]))
+    }
+  }
+}
+
+
+
+saveRDS(object =  fgsea_analysis,
+        file = "output/fgsea_analysis_all.RDS")
+
+saveRDS(object =  fgsea_analysis2,
+        file = "output/fgsea_analysis_all_upd_outcomes_20190508.RDS")
+
+```
+
+
+```{r ledge_networks}
+
+ifn_net_gm <- import_genemania_network("output/data/ifn-ledge-network_table_gene_mania.txt.csv",
+                                 "output/data/ifn-ledge-node_table_gene_mania.txt.csv")
+
+
+
+
+ledge_network <- function(fgsea_table, sep = ", ", genemania = NA, pathways ){
+   network <- fgsea_table %>%
+          filter(pathway %in% pathways) %>%
+          separate_rows(leadingEdge, sep = sep) %>%
+          dplyr::rename(source = "pathway",
+                        target = "leadingEdge") %>%
+          dplyr::select(source, target) %>%
+          mutate(edge_type = "leadingEdge") %>%
+          unique()
+  
+   node <- network %>%
+            dplyr::select(source) %>%
+            dplyr::rename(node = "source") %>%
+            unique() %>%
+            mutate(node_type = "pathway") %>%
+            bind_rows(network %>%
+            dplyr::select(target) %>%
+            dplyr::rename(node = "target") %>%
+            unique() %>%
+            mutate(node_type = "gene") )
+   
+  if(!is.na(genemania)){
+    network <- network %>%
+                bind_rows(genemania)
+  }
+   out <- list('network' = network, "node_table" = node)
+  return(out)
+}
+
+ifn_ledge <- ledge_network(fgsea_table = module_table_breadth, 
+                      pathways = module_table_breadth[grepl("Type I IFN",
+                                          module_table_breadth$pathway),]$pathway,
+                      genemania = ifn_net_gm)
+
+ifn_ledge_node_mod <- ifn_ledge$node_table %>%
+                      left_join(., merged_tonic, by = c("node" = "hgnc_symbol") ) %>%
+                      mutate(condition = ifelse(node_type == "pathway", "pathway", condition)) %>%
+                      mutate(condition = ifelse(is.na(condition), "ND", condition)) %>%
+                      mutate(antiviral = ifelse(node %in% antiviral_isg$Gene_symbol, "antiviral",
+                                                "ND")) %>%
+           mutate(antiviral = ifelse(node %in% antiviral_isg[antiviral_isg$flavivirus ==
+                                                               "Flavivirus",]$Gene_symbol,
+                                     "Flavivirus",antiviral)) %>%
+           mutate(antiviral = ifelse(node %in% antiviral_isg[antiviral_isg$flavivirus ==
+                                                               "DENV",]$Gene_symbol,
+                                     "DENV",antiviral)) #%>%
+    
+  
+tonic_ifn_gsColl <- lapply(c("B_MF_TONIC_Sensitive", "B_MF_TONIC_Insensitive"),
+                            function(x){
+      # df <- ifn_ledge_node_mod[ifn_ledge_node_mod$condition == x,]$node
+     gs <- GeneSet(geneIds= unique(ifn_ledge_node_mod[ifn_ledge_node_mod$condition == x,]$node), 
+                      setName = x, 
+                      shortDescription = x)            
+})
+
+
+toGmt(tonic_ifn_gsColl, con = "output/data/tonic_IFNs.gmt")
+
+
+
+write_tsv(x = ifn_ledge$network, path = 'output/data/ifn-ledge-netwwork_table.txt')
+write_tsv(x = ifn_ledge_node_mod, path = 'output/data/ifn-ledge-node_table.txt')
+
+
+
+
+isg_gsColl <- list(GeneSet(geneIds= ifn_ledge_node_mod[ifn_ledge_node_mod$antiviral != "ND",]$node,
+                      setName = "ANTIVIRAL_ISG", 
+                      shortDescription = "antiviral_interferon_module_genes") ,
+                   GeneSet(geneIds= ifn_ledge_node_mod[grepl("TONIC_Sensitive",
+                                                      ifn_ledge_node_mod$condition),]$node, 
+                      setName = "TONIC_SENSITIVE_ISG", 
+                      shortDescription = "Tonic_sensitive_interferon_module_genes"),
+                     GeneSet(geneIds= ifn_ledge_node_mod[grepl("TONIC_Insensitive",
+                                                      ifn_ledge_node_mod$condition),]$node, 
+                      setName = "TONIC_INSENSITIVE_ISG", 
+                      shortDescription = "Tonic_insensitive_interferon_module_genes")
+                   )
+isg_gsColl <- GeneSetCollection(isg_gsColl)
+
+# 
+# 
+# hs_GM <- build_genemania_db(species = "Homo_sapiens")
+
+tonic_ifn_vs_serotypes <- sapply(names(meta_dds2)[grepl("AUCp|Cumula", names(meta_dds2))], simplify = F, USE.NAMES = T, function(x){
+              raw <- meta_dds2[[x]]$res %>%
+                      as.data.frame() %>%
+                      rownames_to_column("ensembl_gene_id") %>%
+                      inner_join(., all_ids, by = "ensembl_gene_id" ) %>%
+                      mutate(pvalue = ifelse(pvalue > 0.05, 1, pvalue)) %>%
+                      mutate(logp = -log10(pvalue) * sign(log2FoldChange)) %>%
+                      inner_join(., ifn_ledge_node_mod, by = c("hgnc_symbol" = "node")) %>%
+                      mutate(pvalue = as.numeric(pvalue)) %>%
+                      dplyr::select(hgnc_symbol, logp, condition, antiviral) %>%
+                      mutate(condition = gsub("B_MF_", "", condition)) %>%
+                      mutate(condition = gsub("TONIC", "Tonic", gsub("_", " ", condition))) %>%
+                      mutate(antiviral = gsub("DENV" , "Flavivirus antiviral", antiviral)) %>%
+                      mutate(antiviral = ifelse(antiviral == "Flavivirus", "Flavivirus antiviral", antiviral)) %>%
+                      mutate(antiviral = str_to_title(antiviral)) %>%
+                      mutate(antiviral = gsub("Nd", "ND", antiviral)) %>%
+                      dplyr::rename(`Antiviral activity` = "antiviral",
+                                    `Tonic Sensitivity` = "condition") %>%
+                      mutate(outcome = x) %>%
+                      arrange( `Antiviral activity`, `Tonic Sensitivity`, desc(logp),) %>%
+                      mutate(outcome = gsub("Cumulative_Breadth_dichot", "Breadth", outcome)) %>%
+                      mutate(outcome = gsub("_AUCp_log", "", outcome)) 
+                      
+                      
+})
+
+
+tonic_ifn_heatmap_annotations <- do.call("rbind", tonic_ifn_vs_serotypes) %>%
+                                  mutate(outcome = paste(outcome, "logp", sep = "_")) %>%
+                                  spread(outcome, logp, fill = 0) %>%
+                                  arrange(match(hgnc_symbol, tonic_ifn_vs_serotypes$Cumulative_Breadth_dichot$hgnc_symbol )) %>%
+                                  column_to_rownames("hgnc_symbol")
+
+tonic_hm_color_annots <- sapply(colnames(tonic_ifn_heatmap_annotations[c(3:7)]), simplify = F, USE.NAMES = T, function(x){
+            out <- colorAssign(tonic_ifn_heatmap_annotations[[x]], scale_limits = c(-max(abs(tonic_ifn_heatmap_annotations[c(3:7)])),
+                                                                                    max(abs(tonic_ifn_heatmap_annotations[c(3:7)]))))
+  
+})
+
+
+
+
+tonic_hm_color_annots <- c(tonic_hm_color_annots, list("Tonic Sensitivity" = c("Tonic Sensitive" = "#99ff00", 
+                                                                               "Tonic Insensitive" = "#ff3e64",
+                                                                               "ND" = "black"),
+                                                       "Antiviral activity" = c("Flavivirus Antiviral" = "#de5aff",
+                                                                                "Antiviral" = "#00ffcc",
+                                                                                "ND" = "white"),
+                                                       "DV1_AUCp_log" = c("white", "darkgreen"),
+                                                       "DV2_AUCp_log" = c("white", "darkgreen"),
+                                                       "DV3_AUCp_log" = c("white", "darkgreen"),
+                                                       "DV4_AUCp_log" = c("white", "darkgreen")))
+
+
+tonic_mat <- combat_corr_filt %>%
+            dplyr::select(-EnsID) %>%
+            column_to_rownames("hgnc_symbol") %>%
+            as.matrix()
+
+nr_LS <- readLines("../outcomes/non-responder_PIDs.txt")
+
+breadth_dv3_order <- outcome_df %>%
+                    dplyr::filter(Immune_status_at_baseline == "Naive" & Group == "A" & Vaccine_status == "Vaccine" ) %>%
+                    filter(PID %in% colnames(tonic_mat)) %>%
+                    arrange(Cumulative_Breadth_dichot, DV3_AUCp_log) %>%
+                    mutate(responders = ifelse(PID %in% nr_LS, "NR", "R")) %>%
+                    column_to_rownames("PID")
+                    #
+
+              
+tonic_ifn_hm <- pheatmap(mat = t(scale(t(tonic_mat[row.names(tonic_ifn_heatmap_annotations),row.names(breadth_dv3_order)]))),
+                   scale = "none",
+                   color = colorLS,
+                   cluster_rows = F,
+                   cluster_cols = F,
+                    annotation_row = tonic_ifn_heatmap_annotations[c("Antiviral activity", "Tonic Sensitivity", 
+                                                                     "DV4_logp", "DV3_logp", "DV2_logp", "DV1_logp")],
+                   #annotation_col = col_annot,
+                   annotation_col = breadth_dv3_order[,c("DV1_AUCp_log","DV2_AUCp_log","DV3_AUCp_log","DV4_AUCp_log")],
+                   annotation_colors = tonic_hm_color_annots,
+                   show_colnames = F,
+                   cellwidth = 8,
+                   cellheight = 8,
+                   fontsize = 6,
+                   height = 12,
+                   width = 10,
+                   #main = x,
+                   filename = file.path(figureDir, "tonic_IFN_vs_serotypes.pdf"))
+
+```
+
+
+
+
+
+
+### Output figures from gsea analysis
+``` {r NES_barplots, message = FALSE}
+gsea_filter <- function(gsea_raw, length) {
+  gsea_raw <- as.data.frame(gsea_raw) %>% 
+    mutate(absNES = abs(NES)) %>%
+    arrange(-absNES) %>%
+    filter(padj < 0.05)
+  gsea_filt <- gsea_raw[c(1:length),] %>% arrange(-NES) %>%
+    filter(!is.na(pathway)) %>%
+    dplyr::select(-absNES) 
+  return(gsea_filt)
+}
+
+
+
+NES_barchart <- function(df, filename, title, width = 0.2, space_width = NULL,
+                         xcol = 'pathway', ycol = 'NES', ranking = 'NES', fill = 'logp',
+                         xlabel = "Normalized Enrichment Score (NES)",
+                         ylabel = 'Pathway') {
+  # print(head(df))
+  # df <- df %>% 
+  #   mutate(pathway = ifelse(str_length(pathway) >50, paste(substr(pathway,1,50)," ...", sep=""),pathway))
+  # print(head(df))
+  df_annot <- df 
+  colorLS <- colorRampPalette(colors = c("blue", "white", "red"))(500)
+  topScale <- max(abs(df_annot[fill]))
+  myBreaks <- seq(-topScale, topScale, length.out = 500)
+  p <- ggplot(df_annot, aes_string(x=paste0("reorder(",xcol,",",ranking ,")"), y= ycol,
+                                  fill = fill))  +
+           geom_bar(stat='identity', width=width, position =  position_dodge(width = space_width)) +
+           labs(x=ylabel, y= xlabel) +
+           theme_bw() + 
+           labs(title = title) + 
+           theme(axis.title = element_text(family = "Times", face="bold", size=16)) +
+           theme(axis.text = element_text(family = "Times", face="bold", size=8)) + 
+           scale_fill_gradientn(colours = colorLS, limits = c(-topScale, topScale)) +
+           coord_flip()
+  ggsave(p,
+         filename= filename,
+         device = "pdf")
+  return(p)
+}
+
+
+
+GSEA_fig_Dir <- setup_dir(file.path(figureDir,"gsea_NES"))
+
+   
+# for(i in names(fgsea_analysis)){
+#   for(j in names(geneset_list)){
+#     output_name <- paste(i,j,sep="_")
+#     if(dim(fgsea_analysis[[i]][[j]]$output)[1] > 0){
+#        NES_barchart(gsea_filter(fgsea_analysis[[i]][[j]]$output,30),
+#                  file.path(GSEA_fig_Dir,paste("shLFC_",output_name,".pdf")),
+#                  title = output_name)
+#     } else {
+#       print(c(i,j,"No enrichment"))
+#     }
+#   }
+# }
+
+
+
+```
+
+```{r SLEA}
+
+# SLEA function (Sample Level Enrichment Analysis) function(z-score per sample)
+doSLEA <- function(expression_matrix, geneSet) {
+            # scale expression
+            exprsMat  <- expression_matrix
+            # extract expression of leGenes of each geneset
+            comm <- intersect(geneSet, rownames(exprsMat))
+            gsDF <- exprsMat[comm, ]
+            # calculate mean expression per sample
+            gsM <- colMeans(gsDF)
+            # extract random genes of size of the geneSet from full probeset and calculate mean
+            # and perform this for 'n' permutations
+            nperm <- lapply(1:1000, function(j) {
+                    # set seed for every permutation
+                    set.seed(j)
+                    rGSDF <- exprsMat[sample.int(nrow(exprsMat), length(comm)), ]
+                    rGSM <- colMeans(rGSDF)
+                    return(value = rGSM)
+                })
+            permDF <- do.call(rbind, nperm)
+            
+            zscore <- (gsM - colMeans(permDF)) / apply(permDF,2,sd)
+            sleaDF <- zscore %>% as.data.frame()
+            return(value = sleaDF)
+        }
+
+
+
+
+```
+
+
+
+
+
+```{r fgsea_figure_funcs}
+
+heatmap_gap_clustering <- function(pheatmap_object,K.max,dimension = "row"){
+  gap_check <- 0
+  K.max_mod <- K.max
+  while(gap_check == 0) {
+    if(dimension == "row"){
+      dendrogram_object <- pheatmap_object$tree_row$merge
+    }else {
+      dendrogram_object <- pheatmap_object$tree_col$merge
+    }
+    gap_stat <- clusGap(dendrogram_object, FUN = kmeans, nstart = 25,
+                  K.max = K.max_mod, B = 500)
+    gap_stat_df <- as.data.frame(gap_stat$Tab)
+    gap_stat_df$nb.clusters <- row.names(gap_stat_df)
+    
+    for(i in 1:dim(dendrogram_object)[1]){
+      if(gap_stat_df$gap[i] == dim(gap_stat_df)[1]){
+        K.max_mod <- dim(dendrogram_object)[1]
+        print("Firstmax is equal to the maximum. Recomputing on total clusters")
+      } else if(gap_stat_df$gap[i] > gap_stat_df$gap[i+1]) {
+        firstmax <- i
+        gap_check <- 1
+        break
+      }
+    } 
+  }
+  
+  gap_stat_df$nbclust <- as.numeric(row.names(gap_stat_df))
+  
+  p <- ggplot(gap_stat_df, aes(x = nbclust, y= gap)) + 
+    geom_point() + 
+    theme_bw() + 
+    geom_line() + 
+    geom_vline(xintercept=firstmax, linetype = "dotted")
+  
+  cluster_annot <- list()
+  cluster_annot$firstmax <- firstmax
+  cluster_annot$gap_stat <- gap_stat_df
+  cluster_annot$dimension <- dimension
+  cluster_annot$plot <- p
+  
+  if (dimension == "row"){
+    cluster_annot$df<- as.data.frame(cutree(pheatmap_object$tree_row, k=firstmax))
+  } else {
+    cluster_annot$df<- as.data.frame(cutree(pheatmap_object$tree_col, k=firstmax))
+  }
+  colnames(cluster_annot$df) <- "clusterID"
+  cluster_annot$df$clusterID <- as.factor(as.character(cluster_annot$df$clusterID))
+  return(cluster_annot)
+}
+
+gsea_hm <- function(fgsea_object,
+                    contrasts,
+                    geneset,
+                    pval_thr,
+                    filename, 
+                    clusterRowsGap = TRUE, 
+                    subset = c(),
+                    cleanup =c(),
+                    cleanup_cols= c(), 
+                    top = 30, 
+                    transpose = FALSE,
+                    width = 12,
+                    height = 8,
+                    legend = TRUE){
+  df <- c()
+  
+  contrast_iter <- names(fgsea_object)
+  contrast_iter <- contrast_iter[contrast_iter %in% contrasts]
+  contrast_cols <- contrast_iter
+  top_pathways <- list()
+  for(i in contrast_iter) {
+    if(dim(fgsea_object[[i]][[geneset]][["output"]][1]) > 0){
+      df_temp <- fgsea_object[[i]][[geneset]][["output"]] %>%
+      as.data.frame(.) %>%
+      filter(padj <= pval_thr) 
+
+      top_df <- df_temp %>%
+        arrange(padj)
+      top_pathways[[i]] <-  top_df$pathway
+      
+      df_temp <- df_temp %>%
+        dplyr::select(pathway,NES)
+        colnames(df_temp)[2] <- i
+    } else {
+      df_temp <- c()
+      contrast_cols <- contrast_cols[!contrast_cols == i]
+    } 
+    
+      if(!is.data.frame(df)){
+        df <- df_temp
+      } else if (is.data.frame(df_temp)){
+        df <- merge(df,df_temp, by="pathway", all=TRUE)
+      }
+  } 
+
+  
+  df <- df %>%
+    gather(contrast,NES,-pathway) %>%
+    mutate(NES = ifelse(is.na(NES), 0 , NES)) %>%
+    mutate(NES = as.numeric(NES)) %>%
+    spread(contrast,NES) 
+  df <- df[,c("pathway",contrast_cols)]
+  
+  if(length(subset) > 0){
+    top_grep <- c()
+    
+    for(i in top_pathways){
+      top_grep_temp <- i
+      top_grep <- c(top_grep, top_grep_temp[grepl(subset, top_grep_temp)][1:top])
+    }
+    top_grep <- unique(top_grep)
+    top_grep <- top_grep[!is.na(top_grep)]
+    df <- df %>%
+      filter(grepl(subset,pathway)) %>%
+      filter(pathway %in% top_grep)
+  }
+  
+  
+  
+  hm_object <- list()
+  hm_object$genesets <- df$pathway
+  for(i in names(cleanup)){
+    df$pathway <- gsub(i,cleanup[[i]],df$pathway)
+  }
+  for(i in names(cleanup_cols)){
+    colnames(df) <- gsub(i, cleanup_cols[[i]], colnames(df))
+  }
+  
+  df <- distinct(df, pathway, .keep_all = TRUE) %>%
+    mutate(pathway = toupper(pathway)) %>%
+    column_to_rownames("pathway") %>%
+    as.matrix(.)
+
+  
+  paletteLength <- 500
+  colorLS <- colorRampPalette(colors = c("blue", "cyan",
+                                         "white",
+                                        "yellow", "red"))(paletteLength)
+
+  topScale <- max(abs(min(df)),abs(max(df)))
+  myBreaks <- seq(-topScale, topScale, length.out=paletteLength)
+  hm.parameters <- list(
+    mat = df,
+    main = paste("GSEA_",geneset, sep=""),
+    color = colorLS,
+    fontsize= 8,
+    cellheight = 14,
+    cellwidth = 14,
+    show_colnames = TRUE,
+    annotation_names_row = FALSE,
+    breaks = myBreaks,
+    cluster_cols = FALSE,
+    angle_col = 45,
+    filename = filename,
+    width = width,
+    height = height,
+    legend = legend
+  )
+    if(transpose == TRUE){
+    hm.parameters$mat <- t(df)
+    hm.parameters$cluster_cols <- TRUE
+    hm.parameters$cluster_rows <- FALSE
+    hm.parameters$treeheight_col <- 5
+    hm.parameters$angle_col <- 315
+  }   
+  
+  
+  
+  if (clusterRowsGap == FALSE) {
+    p <- do.call(pheatmap, hm.parameters)
+    
+    hm_object$clusterRow <- "none"
+  } else {
+    p_temp <- pheatmap(df)
+    
+    cluster_annot <- heatmap_gap_clustering(p_temp, K.max = dim(df)[1] -1 )
+    dev.off()
+
+    p <- pheatmap(df,
+             main = paste("GSEA_",geneset, sep=""),
+                  color = colorLS,
+                  fontsize= 8,
+                  cellheight = 9,
+                  cellwidth = 9,
+                  show_colnames = FALSE,
+                  annotation_names_row = FALSE,
+                  cluster_cols = FALSE,
+                  breaks = myBreaks,
+                  annotation_row = cluster_annot$df["clusterID"],
+                  filename = filename,
+                  angle_col = 45)
+
+
+    hm_object$clusterRow <- cluster_annot
+  }
+  
+  hm_object$plot <- p
+  hm_object$matrix <- df
+  return(hm_object)
+}
+
+
+```
+
+```{r fgsea_figures }
+
+early_breadth <- c("D56_Breadth","D91_Breadth", "D180_Breadth")
+#early_breadth <- c("D28_Breadth","D56_Breadth","D91_Breadth", "D180_Breadth")
+
+late_breadth <- c("D208_Breadth","D236_Breadth","D271_Breadth")
+AUCp <- c("DV1_AUCp_log","DV2_AUCp_log","DV3_AUCp_log","DV4_AUCp_log")
+dichot_breadth <- c("D91_Breadth_dichot", "Cumulative_Breadth_dichot" )
+# AUCp_non_tr <- c("DV1_AUCp","DV2_AUCp","DV3_AUCp","DV4_AUCp")
+# AUCb <- c("DV1_AUCb_log","DV2_AUCb_log", "DV3_AUCb_log", "DV4_AUCb_log")
+
+#fgsea_analysis <- c(fgsea_analysis, fgsea_analysis2)
+
+gsea_hm(fgsea_object = fgsea_analysis,
+        contrasts =  early_breadth,
+        geneset = "hallmark",
+        pval_thr =  0.05, 
+        filename = file.path(GSEA_fig_Dir,"early_breadth_hallmark_GSEA_hm.pdf"), 
+        cleanup=list("_" = " " ,"HALLMARK" = ""),
+        cleanup_cols= list("_" = " ", "log" = ""),
+        clusterRowsGap = FALSE,
+        transpose = TRUE)
+
+gsea_hm(fgsea_object = fgsea_analysis,
+        contrasts =  AUCp,
+        geneset = "hallmark",
+        pval_thr =  0.05,
+        filename = file.path(GSEA_fig_Dir,"AUCp_hallmark_GSEA_hm.pdf"),
+        cleanup=list("_" = " " ,"HALLMARK" = ""),
+        cleanup_cols= list("_" = " ", "log" = "", "AUCp" = "", "  " = " "),
+        clusterRowsGap = FALSE,
+        transpose = TRUE,
+        width = 15,
+        height = 8,
+        legend = FALSE)
+
+
+
+gsea_hm(fgsea_object = fgsea_analysis2,
+        contrasts =  dichot_breadth,
+        geneset = "hallmark",
+        pval_thr =  0.05, 
+        filename = file.path(GSEA_fig_Dir,"dichot_breadth_hallmark_GSEA_hm.pdf"), 
+        cleanup=list("_" = " " ,"HALLMARK" = ""),
+        cleanup_cols= list("_" = " ", "log" = ""),
+        clusterRowsGap = FALSE,
+        transpose = TRUE)
+
+gsea_hm(fgsea_object = fgsea_analysis2,
+        contrasts =  AUCp,
+        geneset = "hallmark",
+        pval_thr =  0.05,
+        filename = file.path(GSEA_fig_Dir,"AUCp_hallmark_GSEA_hm.pdf"),
+        cleanup=list("_" = " " ,"HALLMARK" = ""),
+        cleanup_cols= list("_" = " ", "log" = "", "AUCp" = "", "  " = " "),
+        clusterRowsGap = FALSE,
+        transpose = TRUE,
+        width = 15,
+        height = 8,
+        legend = FALSE)
+
+
+
+
+
+##### c2_cytokines
+
+c2_subset_inflam <- paste(c("IL4","IL5","IL6","IL7","IL8","IL9","IL10","IL12","IL13","IL15","IL17",
+                            "IL18","IL21","IL22","IL23","IL27","IL1","IL2","IL3","TNF","TGFB","TSLP",
+                            "IFNA","IFNB","IFNG", "IFN", "IL33", "TH1",  "TH2", "TH17", "CXCR", "CCR", "TCR"), collapse="|")
+
+# gsea_hm(fgsea_object = fgsea_analysis,
+#         contrasts =  early_breadth,
+#         geneset = "c2c5c7",
+#         pval_thr =  0.05, 
+#         filename = file.path(GSEA_fig_Dir,"early_breadth_cytok_GSEA_hm.pdf"), 
+#         cleanup=list("_" = " "),
+#         cleanup_cols= list("_" = " "),
+#         clusterRowsGap = FALSE,
+#         subset = c2_subset_inflam,
+#         top = 30,
+#         transpose = TRUE)
+# 
+# gsea_hm(fgsea_object = fgsea_analysis,
+#         contrasts =  AUCp,
+#         geneset = "c2c5c7",
+#         pval_thr =  0.05, 
+#         filename = file.path(GSEA_fig_Dir,"AUCp_cytok_GSEA_hm.pdf"), 
+#         cleanup=list("_" = " " ),
+#         cleanup_cols= list("_" = " ", "log" = "", "AUCp" = "", "  " = " "),
+#         clusterRowsGap = FALSE,
+#         subset = c2_subset_inflam,
+#         top = 20,
+#         transpose = TRUE)
+
+gsea_hm(fgsea_object = fgsea_analysis2,
+        contrasts =  dichot_breadth,
+        geneset = "c2c5c7",
+        pval_thr =  0.05, 
+        filename = file.path(GSEA_fig_Dir,"dichot_breadth_cytok_GSEA_hm.pdf"), 
+        cleanup=list("_" = " "),
+        cleanup_cols= list("_" = " "),
+        clusterRowsGap = FALSE,
+        subset = c2_subset_inflam,
+        top = 30,
+        transpose = TRUE)
+
+gsea_hm(fgsea_object = fgsea_analysis2,
+        contrasts =  AUCp,
+        geneset = "c2c5c7",
+        pval_thr =  0.05, 
+        filename = file.path(GSEA_fig_Dir,"AUCp_cytok_GSEA_hm.pdf"), 
+        cleanup=list("_" = " " ),
+        cleanup_cols= list("_" = " ", "log" = "", "AUCp" = "", "  " = " "),
+        clusterRowsGap = FALSE,
+        subset = c2_subset_inflam,
+        top = 20,
+        transpose = TRUE)
+
+
+
+c2_subset_metab <- paste(c("GLYCOLY","OXPHOS","OXIDATIVE","BUTYRATE","CHOLESTEROL","MTOR","RAPAMYCIN","HIF1",
+                          "LDH","MITOCHONDRIA","STEROID","METABOLISM","PHOSPHOLIPID", "SPHINGOLIPID", "FATTY",
+                          "SPHINGOLIPIDS", "CARNITINE","TCA"), collapse="|")
+
+# gsea_hm(fgsea_object = fgsea_analysis,
+#         contrasts =  early_breadth,
+#         geneset = "c2c5c7",
+#         pval_thr =  0.05,
+#         filename = file.path(GSEA_fig_Dir,"early_breadth_metabolism_GSEA_hm.pdf"),
+#         cleanup=list("_" = " " ,"HALLMARK" = ""),
+#         cleanup_cols= list("_" = " "),
+#         clusterRowsGap = FALSE,
+#         subset = c2_subset_metab,
+#         top = 20,
+#         transpose = TRUE)
+# 
+# gsea_hm(fgsea_object = fgsea_analysis,
+#         contrasts =  AUCp,
+#         geneset = "c2c5c7",
+#         pval_thr =  0.05, 
+#         filename = file.path(GSEA_fig_Dir,"AUCp_metabolism_GSEA_hm.pdf"), 
+#         cleanup=list("_" = " " ),
+#         cleanup_cols= list("_" = " ", "log" = "", "AUCp" = "", "  " = " "),
+#         clusterRowsGap = FALSE,
+#         subset = c2_subset_metab,
+#         top = 20,
+#         transpose = TRUE)
+
+gsea_hm(fgsea_object = fgsea_analysis2,
+        contrasts =  dichot_breadth,
+        geneset = "c2c5c7",
+        pval_thr =  0.05,
+        filename = file.path(GSEA_fig_Dir,"dichot_breadth_metabolism_GSEA_hm.pdf"),
+        cleanup=list("_" = " " ,"HALLMARK" = ""),
+        cleanup_cols= list("_" = " "),
+        clusterRowsGap = FALSE,
+        subset = c2_subset_metab,
+        top = 20,
+        transpose = TRUE)
+
+gsea_hm(fgsea_object = fgsea_analysis2,
+        contrasts =  AUCp,
+        geneset = "c2c5c7",
+        pval_thr =  0.05, 
+        filename = file.path(GSEA_fig_Dir,"AUCp_metabolism_GSEA_hm.pdf"), 
+        cleanup=list("_" = " " ),
+        cleanup_cols= list("_" = " ", "log" = "", "AUCp" = "", "  " = " "),
+        clusterRowsGap = FALSE,
+        subset = c2_subset_metab,
+        top = 20,
+        transpose = TRUE)
+
+c7_subset_populations <- paste(c("TFH","T_FOLLICULLAR","MONOCYTE", "B CELL", "NAIVE", "BCELL"), collapse="|")
+# 
+# gsea_hm(fgsea_object = fgsea_analysis,
+#         contrasts =  early_breadth,
+#         geneset = "c2c5c7",
+#         pval_thr =  0.05, 
+#         filename = file.path(GSEA_fig_Dir,"early_breadth_populations_GSEA_hm.pdf"), 
+#         cleanup=list("_" = " " ,"HALLMARK" = ""),
+#         cleanup_cols= list("_" = " "),
+#         clusterRowsGap = FALSE,
+#         subset = c7_subset_populations,
+#         top = 15,
+#         transpose = TRUE)
+# 
+# gsea_hm(fgsea_object = fgsea_analysis,
+#         contrasts =  AUCp,
+#         geneset = "c2c5c7",
+#         pval_thr =  0.05, 
+#         filename = file.path(GSEA_fig_Dir,"AUCp_populations_GSEA_hm.pdf"), 
+#         cleanup=list("_" = " " ),
+#         cleanup_cols= list("_" = " ", "log" = "", "AUCp" = "", "  " = " "),
+#         clusterRowsGap = FALSE,
+#         subset = c7_subset_populations,
+#         top = 20,
+#         transpose = TRUE)
+
+
+gsea_hm(fgsea_object = fgsea_analysis2,
+        contrasts =  dichot_breadth,
+        geneset = "c2c5c7",
+        pval_thr =  0.05, 
+        filename = file.path(GSEA_fig_Dir,"dichot_breadth_populations_GSEA_hm.pdf"), 
+        cleanup=list("_" = " " ,"HALLMARK" = ""),
+        cleanup_cols= list("_" = " "),
+        clusterRowsGap = FALSE,
+        subset = c7_subset_populations,
+        top = 15,
+        transpose = TRUE)
+
+gsea_hm(fgsea_object = fgsea_analysis2,
+        contrasts =  AUCp,
+        geneset = "c2c5c7",
+        pval_thr =  0.05, 
+        filename = file.path(GSEA_fig_Dir,"AUCp_populations_GSEA_hm.pdf"), 
+        cleanup=list("_" = " " ),
+        cleanup_cols= list("_" = " ", "log" = "", "AUCp" = "", "  " = " "),
+        clusterRowsGap = FALSE,
+        subset = c7_subset_populations,
+        top = 20,
+        transpose = TRUE)
+
+
+# gsea_hm(fgsea_object = fgsea_analysis,
+#         contrasts =  early_breadth,
+#         geneset = "c3",
+#         pval_thr =  0.05, 
+#         filename = file.path(GSEA_fig_Dir,"early_breadth_c3_GSEA_hm.pdf"), 
+#         cleanup=list("_" = " " ,"HALLMARK" = ""),
+#         cleanup_cols= list("_" = " "),
+#         clusterRowsGap = FALSE,
+#         top = 30,
+#         transpose = TRUE)
+# 
+# gsea_hm(fgsea_object = fgsea_analysis,
+#         contrasts =  AUCp,
+#         geneset = "c3",
+#         pval_thr =  0.05, 
+#         filename = file.path(GSEA_fig_Dir,"AUCp_c3_GSEA_hm.pdf"), 
+#         cleanup=list("_" = " " ),
+#         cleanup_cols= list("_" = " ", "log" = "", "AUCp" = "", "  " = " "),
+#         clusterRowsGap = FALSE,
+#         top = 10,
+#         transpose = TRUE,
+#         width = 20
+#         )
+
+
+gsea_hm(fgsea_object = fgsea_analysis2,
+        contrasts =  dichot_breadth,
+        geneset = "c3",
+        pval_thr =  0.05, 
+        filename = file.path(GSEA_fig_Dir,"dichot_breadth_c3_GSEA_hm.pdf"), 
+        cleanup=list("_" = " " ,"HALLMARK" = ""),
+        cleanup_cols= list("_" = " "),
+        clusterRowsGap = FALSE,
+        top = 10,
+        transpose = TRUE)
+
+gsea_hm(fgsea_object = fgsea_analysis2,
+        contrasts =  AUCp,
+        geneset = "c3",
+        pval_thr =  0.05, 
+        filename = file.path(GSEA_fig_Dir,"AUCp_c3_GSEA_hm.pdf"), 
+        cleanup=list("_" = " " ),
+        cleanup_cols= list("_" = " ", "log" = "", "AUCp" = "", "  " = " "),
+        clusterRowsGap = FALSE,
+        top = 10,
+        transpose = TRUE,
+        width = 20
+        )
+
+
+
+
+
+
+
+```
+
+
+```{r temp_DEG_HM}
+
+
+d91_degs <- meta_dds2$D91_Breadth$res %>%
+            as.data.frame(.) %>%
+            rownames_to_column("EnsID") %>%
+            dplyr::filter(!is.na(padj)) %>%
+            dplyr::filter(padj < 0.05) %>%
+            .$EnsID
+
+
+combat_corr_DEGS <- combat_corr[row.names(combat_corr) %in% d91_degs,] 
+order <- colData(meta_dds$D91_Breadth$dds) %>%
+          as.data.frame(.) %>%
+          rownames_to_column("filename") %>%
+          arrange(outcome_var) %>%
+          column_to_rownames("filename")
+
+
+combat_corr_DEGS <- combat_corr_DEGS[,match(row.names(order), colnames(combat_corr_DEGS))]
+#combat_corr_DEGS <- combat_corr_DEGS[,order(combat_corr_DEGS)]
+                    
+  
+  
+paletteLength <- 500
+colorLS <- colorRampPalette(colors = c("blue", "cyan",
+                                       "white",
+                                      "yellow", "red"))(paletteLength)
+
+combat_corr_DEGS <- t(scale(t(combat_corr_DEGS)))
+topScale <- max(abs(min(combat_corr_DEGS)),abs(max(combat_corr_DEGS)))
+myBreaks <- seq(-topScale, topScale, length.out=paletteLength)
+pheatmap_DEGS <- pheatmap(mat = combat_corr_DEGS,
+                          #scale = "row",
+                          color = colorLS,
+                          breaks = myBreaks,
+                          show_rownames = FALSE,
+                          show_colnames = FALSE,
+                          treeheight_row = 8,
+                          cluster_cols = FALSE,
+                          # treeheight_col = 8,
+                          cellwidth = 6,
+                          annotation_col = order["outcome_var"],
+                          filename = file.path(figureDir,"templateDEG.pdf"))
+
+
+
+
+d91_il_ledge <- fgsea_cytok$D91_Breadth$c2c5c7$output%>%
+                as.data.frame(.) %>%
+                dplyr::filter(pathway == "GSE19198_CTRL_VS_IL21_TREATED_TCELL_24H_UP" ) %>%
+                .$leadingEdge
+
+
+
+
+
+mart = useMart("ensembl", dataset="hsapiens_gene_ensembl")
+all_ids <- 
+
+
+temp_id <-  getBM(attributes= c("hgnc_symbol","ensembl_gene_id"),
+                  filters = 'ensembl_gene_id', values = d91_il_ledge, mart = mart)
+
+mart = useMart("ensembl", dataset="hsapiens_gene_ensembl")
+temp_id2 <-  getBM(attributes= c("hgnc_symbol","ensembl_gene_id"),
+                  filters = 'ensembl_gene_id', values = d91_degs, mart = mart)
+test <- as.data.frame(meta_dds$D91_Breadth$res) %>%
+        rownames_to_column("ensembl_gene_id") %>%
+        inner_join(.,temp_id2, by = "ensembl_gene_id")
+
+annot_row_hm <- temp_id %>%
+                column_to_rownames("ensembl_gene_id")
+
+write.csv(x = temp_id, file = file.path(dataOutDir,"ledge_genes_IL21.csv"))
+
+
+combat_corr_ledge <- combat_corr[row.names(combat_corr) %in% unlist(d91_il_ledge),]
+paletteLength <- 500
+colorLS <- colorRampPalette(colors = c("blue", "cyan",
+                                       "white",
+                                      "yellow", "red"))(paletteLength)
+
+combat_corr_ledge <- t(scale(t(combat_corr_ledge)))
+#combat_corr_ledge <- combat_corr_ledge[combat_corr_ledge]
+combat_corr_ledge <- combat_corr_ledge[,match(row.names(order),colnames(combat_corr_ledge))]
+#combat_corr_ledge <- combat_corr_ledge[,match(row.names(order_d180),colnames(combat_corr_ledge))]
+topScale <- max(abs(min(combat_corr_ledge)),abs(max(combat_corr_ledge)))
+myBreaks <- seq(-topScale, topScale, length.out=paletteLength)
+
+order
+
+heatmap_ledge <- pheatmap(mat = combat_corr_ledge,
+                          #scale = "row",
+                          color = colorLS,
+                          breaks = myBreaks,
+                          show_rownames = TRUE,
+                          show_colnames = FALSE,
+                          treeheight_row = 8,
+                          treeheight_col = 8,
+                          cluster_cols = FALSE,
+                          annotation_col = order["outcome_var"],
+                          cellwidth = 10,
+                          cellheight = 10,
+                          filename = file.path(figureDir,"template_IL-21_ledge.pdf"),
+                          labels_row = annot_row_hm$hgnc_symbol)
+
+order <- colData(meta_dds2$Cumulative_Breadth_dichot$dds) %>%
+          as.data.frame(.) %>%
+          rownames_to_column("filename") %>%
+          arrange(outcome_var) %>%
+          column_to_rownames("filename")
+
+culmin_df <- outcome_df %>% 
+              left_join(., as.data.frame(colData(meta_dds$D91_Breadth$dds)), by = "PID") %>%
+              arrange(outcome_var) %>%
+              dplyr::select(PID, outcome_var, Cumulative_Breadth_dichot) %>%
+              rename(D91_Breadth = "outcome_var") %>%
+              unique(.) %>%
+              remove_rownames() %>%
+              column_to_rownames("PID")
+
+
+
+
+
+ledge_hm_consolidated_culmin <- sapply(merge_gs_breadth_df$pathway, simplify = F, USE.NAMES = T, function(x){
+  hm <- ledge_HM(merge_gs_breadth_df, pathway_select = x, sampleOrder = "average_z")
+  return(hm)
+})
+test <- ledge_HM(merge_gs_breadth_df, pathway_select = "Type I IFN interferome", sampleOrder = "average_z",
+                 additional_annot_tracks = TRUE)
+
+write(ledge_hm_consolidated_culmin$`Type I IFN interferome`, file = "output/data/Type1 IFN_culmin_BR_ledge.txt")
+
+```
+
+
+
+```{r tonic_orthologous}
+tonic_mouse_genes <- read_xls("2nd_run/input/mmc2 (1).xls", skip = 2,  sheet = "S1E" ) %>%
+          rowid_to_column("rowid") %>%
+          filter(!rowid %in% c(277:279)) %>%
+          .$GeneSymbol %>%
+          unique()
+
+mart_mouse = useMart("ensembl", dataset="mmusculus_gene_ensembl")
+human_orthologous_tonic <-  getBM(attributes= c("external_gene_name","hsapiens_homolog_associated_gene_name"),
+                  filters = 'external_gene_name', values = tonic_mouse_genes, mart = mart_mouse) %>%
+                as.data.frame()
+
+
+```
+
+```{r tonic_ifn}
+
+ifn_FC <- read_xls("2nd_run/input/mmc2 (1).xls", skip =2 , sheet = "S1A" )
+
+bcell_tonic <- read_xls("2nd_run/input/mmc2 (1).xls", skip =2 , n_max = 277, sheet = "S1E" ) %>%
+                inner_join(., ifn_FC %>% dplyr::select(ProbeSetID, IFNaFC.B), by = "ProbeSetID")  %>%
+                group_by(GeneSymbol) %>%
+                summarise(mean.IFN.FC.WT = mean(IFN.FC.WT),
+                       mean.IFNaFC.B = mean(IFNaFC.B),
+                       meanTonicIndex = mean(`TonicIndex B cells`),
+                       meanTonicIndex.pval = mean(`TonicIndex pval`)) %>%
+                ungroup() %>%
+                unique() %>%
+                mutate(four = log2(mean.IFN.FC.WT)/4,
+                       six = log2(mean.IFN.FC.WT)/6) %>%
+                mutate(normIndex = log2(meanTonicIndex)) %>%
+                mutate(pval = exp(-meanTonicIndex.pval)) %>%
+                mutate(Sensitivity = ifelse(normIndex < six, "Insensitive", "ND"))  %>%
+                mutate(Sensitivity = ifelse(pval < 0.1 & normIndex < six, "ND", Sensitivity)) %>%
+                mutate(Sensitivity = ifelse(normIndex > four & pval < 0.1, "Sensitive", Sensitivity)) %>%
+                inner_join(., human_orthologous_tonic, by = c("GeneSymbol" = "external_gene_name")) %>%
+                filter(hsapiens_homolog_associated_gene_name != "") %>%
+                filter(hsapiens_homolog_associated_gene_name %in% all_ids$hgnc_symbol) %>%
+                #filter(Sensitivity != "ND") %>%
+                mutate(condition = paste("B_CELLS_TONIC_", toupper(Sensitivity), sep = "")) #%>%
+                # dplyr::select(GeneSymbol, hsapiens_homolog_associated_gene_name, 
+                #               condition, Sensitivity, )
+  
+# flag <-  bcell_tonic %>% 
+#           filter(GeneSymbol %in% c("Stat1", "Rtp4", "Oas2", "Irf7", "Ifit3", "Slfn5", "Ifit1", "Rsad2", "Cxcl10", 
+#                                          "Ifi204", "Il15", "Oas3")) #%>%
+# 
+test <- ggplot(bcell_tonic, aes(x=mean.IFN.FC.WT, y = meanTonicIndex, color = Sensitivity)) +
+        geom_point() +
+        geom_label_repel(data = flag, aes(label = GeneSymbol)) +
+        scale_x_continuous(limits = c(2,40), breaks = c(2,5,10,20,30,40), trans = "log") +
+        scale_y_continuous(limits = c(0.5, 10), breaks = c(0.5, 1, 1.5, 5, 10), trans = "log") +
+        theme_bw()
+
+ggsave(test, filename = "output/figures/tonic_bceells_plot_example.pdf", width = 6, height = 5)
+
+                # mutate(Sensitivity  = ifelse(log2(mean.IFN.FC.WT) < log2(mean.IFNaFC.B)/6, "Insensitive", Sensitivity)) %>%
+                #mutate(pval = 2^-`TonicIndex pval`) %>%
+                # mutate(Sensitive = ifelse(GeneSymbol %in% c("Stat1", "Rtp4", "Oas2", "Irf7", "Ifit3", "Slfn5", 
+                #                                             "Ifit1", "Rsad2"), "Sensitive", "Insensitive")) %>%
+                # mutate(logp = 10^-`TonicIndex pval`) %>%
+                # mutate(Sensitivity = ifelse(10^-`TonicIndex pval` > 0.05, "Insensitive", "ND")) %>%
+                # mutate(Sensitivity = ifelse(`TonicIndex B cells` > 1.5, "Sensitive", Sensitivity)) %>%
+                # filter(GeneSymbol %in% c("Stat1", "Rtp4", "Oas2", "Irf7", "Ifit3", "Slfn5", "Ifit1", "Rsad2", "Cxcl10", 
+                #                          "Ifi204", "Il15", "Oas3")) %>%
+                # split(., f = .$Sensitivity)
+                # filter(GeneSymbol %in%  c("Irf7", "Ifit3", "Cxcl10"))
+
+macro_tonic <- read_xls("2nd_run/input/mmc2 (1).xls", skip =281, sheet = "S1E" ) %>%
+                inner_join(., ifn_FC %>% dplyr::select(ProbeSetID, IFNaFC.MF), by = "ProbeSetID")  %>%
+                group_by(GeneSymbol) %>%
+                summarise(mean.IFN.FC.WT = mean(IFN.FC.WT),
+                       mean.IFNaFC.B = mean(IFNaFC.MF),
+                       meanTonicIndex = mean(`TonicIndex Macrophages`),
+                       meanTonicIndex.pval = mean(`TonicIndex pval Macrophages`)) %>%
+                ungroup() %>%
+                unique() %>%
+                mutate(four = log2(mean.IFN.FC.WT)/4,
+                       six = log2(mean.IFN.FC.WT)/6) %>%
+                mutate(normIndex = log2(meanTonicIndex)) %>%
+                mutate(pval = exp(-meanTonicIndex.pval)) %>%
+                mutate(Sensitivity = ifelse(normIndex < six, "Insensitive", "ND"))  %>%
+                mutate(Sensitivity = ifelse(pval < 0.1 & normIndex < six, "ND", Sensitivity)) %>%
+                mutate(Sensitivity = ifelse(normIndex > four & pval < 0.1, "Sensitive", Sensitivity)) %>%
+                inner_join(., human_orthologous_tonic, by = c("GeneSymbol" = "external_gene_name")) %>%
+                filter(hsapiens_homolog_associated_gene_name != "") %>%
+                filter(hsapiens_homolog_associated_gene_name %in% all_ids$hgnc_symbol) %>%
+                #filter(Sensitivity != "ND") %>%
+                 mutate(condition = paste("MACROPHAGE_TONIC_", toupper(Sensitivity), sep = ""))# %>%
+                # dplyr::select(GeneSymbol, hsapiens_homolog_associated_gene_name, condition, Sensitivity)
+
+merged_tonic <- bind_rows(bcell_tonic, macro_tonic) %>%
+                group_by(hsapiens_homolog_associated_gene_name) %>%
+                mutate(n_conditions = n_distinct(Sensitivity)) %>%
+                ungroup() %>%
+                #filter(n_conditions == 1) %>%
+                mutate(condition = ifelse(n_conditions ==2, 
+                                          paste("B_MF_TONIC", "Sensitive", sep = "_"),
+                                          paste("B_MF_TONIC", "Insensitive", sep = "_"))) %>%
+                 mutate(condition = ifelse(Sensitivity =="Sensitive", 
+                                          paste("B_MF_TONIC", "Sensitive", sep = "_"),
+                                          condition)) %>%         
+                dplyr::rename(hgnc_symbol = "hsapiens_homolog_associated_gene_name") %>%
+                dplyr::select(hgnc_symbol, condition) %>% unique()
+                dplyr::select(-n_conditions)
+
+
+
+concat_tonic <- bind_rows(macro_tonic, bcell_tonic, merged_tonic) %>% split(., f =.$condition)
+```
+
+```{r test_IFN enrichment}
+
+
+fisher_overlap <- function(gene_list1, gene_list2, total_genes){
+  int <- length(intersect(gene_list1, gene_list2))
+  mat <- matrix(c(int, length(gene_list1) - int, length(gene_list2) - int, 
+                     length(setdiff(total_genes, union(gene_list1, gene_list2)))), nrow = 2, ncol = 2)
+  out <- tidy(fisher.test(mat, alternative = "greater"))
+  return(out)
+}
+
+
+
+tonic_enrichment <- do.call("rbind", lapply(unique(ifn_ledge_node_mod$condition), function(x){
+    df_full <- concat_tonic[[x]]
+  
+  out <- fisher_overlap(gene_list1 = concat_tonic[[x]]$hsapiens_homolog_associated_gene_name,
+                       gene_list2 = ifn_ledge_node_mod$node,
+                       total_genes = unique(union(total_t1_IFN_genes$hgnc_symbol,
+                                                  unique(bind_rows(macro_tonic,
+                                                                   bcell_tonic)$hsapiens_homolog_associated_gene_name))))
+    out <- out %>% mutate(condition = x)
+    return(out)
+}))
+
+antiviral_enrichment <- fisher_overlap(gene_list1 = antiviral_genes$V1,
+                       gene_list2 = ifn_ledge$hgnc_symbol,
+                       total_genes = total_t1_IFN_genes$hgnc_symbol)
+
+
+writeLines(intersect(ifn_ledge$hgnc_symbol, concat_tonic$B_CELLS_TONIC_SENSITIVE$hsapiens_homolog_associated_gene_name),
+            con = file.path(outDir, "data/IFN_tonic_genes_intersect.txt"))
+
+```
+
+
+```{r cytokine_chemokine_DEG}
+
+hipc_gmt <- getGmt(con = "~/Documents/GMT_files/HIPC_genelists.gmt")
+
+
+inflamm_genes <- readLines("../../COVID/BAL_sc/covid19/input/inflammasome_gene_filter.txt")
+inflamm_genes <- unique(c(inflamm_genes, "CASP1", "NLRP1", "NLRC5", "AIM2"))
+inflamm_genes <- unique(c(inflamm_genes, all_ids %>% 
+                     filter(grepl("NLR[PC]",hgnc_symbol)) %>% 
+                     .$hgnc_symbol))
+
+hipc_gmt_mod <- sapply(names(hipc_gmt), simplify = F, USE.NAMES = T,  function(x){
+  gs <- hipc_gmt[[x]]
+  
+})
+hipc_gmt_mod[["INFLAMMASOME"]] <- GeneSet(setIdentifier = "INFLAMMASOME",
+                                                    geneIds = inflamm_genes, 
+                                          setName = "INFLAMMASOME")
+
+hipc_gmt_mod <- GeneSetCollection(hipc_gmt_mod)
+
+dv3_order <- outcome_df %>%
+              #dplyr::select(PID, DV3_AUCp_log) %>%
+              unique() %>%
+              arrange(Cumulative_Breadth_dichot,DV3_AUCp_log) %>%
+              .$PID
+
+functional_degs <- sapply(names(hipc_gmt_mod), simplify = F, USE.NAMES = T, function(x){
+    geneIds <- geneIds(hipc_gmt_mod[names(hipc_gmt_mod) == x])[[1]]
+    
+    outcome <- sapply(names(meta_dds2), simplify = F, USE.NAMES = T, function(y){
+      df <- meta_dds2[[y]]$res %>%
+          as.data.frame() %>%
+          rownames_to_column("ensembl_gene_id") %>%
+          inner_join(.,all_ids, by = "ensembl_gene_id") %>%
+          filter(hgnc_symbol %in% geneIds) %>%
+          mutate(logp = -log10(pvalue) * sign(log2FoldChange)) %>%
+          filter(pvalue <0.25) %>%
+          arrange(desc(logp))
+    
+      mat <- as.data.frame(combat_corr_filt) %>%
+              gather(PID, value, -EnsID, -hgnc_symbol ) %>%
+              filter(hgnc_symbol %in% df$hgnc_symbol) %>%
+              group_by(EnsID) %>%
+              mutate(value = scale(value, center = T, scale = T)) %>%
+              ungroup() %>%
+              group_by(PID, hgnc_symbol) %>%
+              summarise(mean = mean(value)) %>%
+              ungroup() %>%
+              spread(PID, mean) %>%
+              column_to_rownames("hgnc_symbol") %>%
+              as.matrix()
+     
+      dv3_order_filt <- dv3_order[dv3_order %in% colnames(mat)]
+      #mat <- mat[df$hgnc_symbol,]
+      mat <- mat[df$hgnc_symbol, dv3_order_filt]
+            
+      out <- list("mat" = mat, "stats" = df)     
+      
+      
+    })
+  return(outcome)
+       
+})
+
+
+### Suppl Figure 3 B
+functional_degs[["MERGED"]] <- sapply(names(meta_dds2), simplify = F, USE.NAMES = T, function(x){
+        cytok <- functional_degs$CYTOKINES[[x]]
+        chemok <- functional_degs$CHEMOKINES[[x]]
+        inflam <- functional_degs$INFLAMMASOME[[x]]
+        
+        df_stats <- do.call("rbind", lapply(c("CYTOKINES", "CHEMOKINES", "INFLAMMASOME"),
+                                                  function(y){
+                              df <- functional_degs[[y]][[x]]$stats %>%
+                                      mutate(class = y)
+                                                    
+                    })) %>%
+                    group_by(hgnc_symbol) %>%
+                    mutate(n_classes = n_distinct(class)) %>%
+                    ungroup() %>%
+                    mutate(keep = ifelse(n_classes > 1 & class == "CYTOKINES", "no", "yes")) %>%
+                    filter(keep == "yes") #%>%
+                    
+        
+       mat <-  do.call("rbind", list(cytok$mat[!row.names(cytok$mat) %in% c(row.names(chemok$mat),
+                                                                     row.names(inflam$mat)),],
+                       chemok$mat, inflam$mat))
+       
+       return(list("stats" = df_stats, "mat" = mat))
+        
+  
+})
+
+
+
+functional_deg_hm <- sapply(names(functional_degs), simplify = F, USE.NAMES = T, function(x){
+  #inp <- functional_degs[[x]]$Cumulative_Breadth_dichot
+  inp <- functional_degs[[x]]$DV3_AUCp_log
+  
+  sig_genes_DV3 <- inp$stats[inp$stats$pvalue <0.05,]$hgnc_symbol
+  
+  inp_Breadth <- functional_degs[[x]]$Cumulative_Breadth_dichot
+  sug_genes_Breadth <- inp_Breadth$stats[inp_Breadth$stats$pvalue <0.25,]$hgnc_symbol
+  outcome_intersect <- intersect(sig_genes_DV3, sug_genes_Breadth)
+  
+  if(length(outcome_intersect)> 1 ){
+    
+    
+
+    mat_p <- do.call("rbind", lapply(names(functional_degs[[x]])[!grepl("D91", 
+                                                       names(functional_degs[[x]]))], 
+                   function(y){
+                   df <-  functional_degs[[x]][[y]]$stats %>%
+                          dplyr::select(hgnc_symbol, logp) %>%
+                          filter(hgnc_symbol %in% outcome_intersect) %>%
+                          mutate(outcome = y)
+                   })) %>%
+                  mutate(outcome = ifelse(grepl("AUC", outcome), outcome, "Breadth")) %>%
+                  mutate(outcome = gsub("_AUCp_log", "", outcome)) %>%
+                  mutate(outcome = paste(outcome, "logp", sep = "_")) %>%
+                  spread(outcome, logp) %>%
+                  filter(hgnc_symbol %in% row.names(inp$mat)) %>%
+                  column_to_rownames("hgnc_symbol")
+    mat_p[is.na(mat_p)] <- 0
+    
+    
+    
+    logp_annot_color <- sapply(colnames(mat_p), simplify = F, USE.NAMES = T, function(y){
+       col_annot_color <- colorAssign(mat_p[[y]], 
+                                      scale_limits = c(-max(abs(mat_p)),
+                                                       max(abs(mat_p))))
+      
+    })
+    
+    logp_annot_color  <-  c(logp_annot_color, 
+                            list("DV1_AUC"= c("white", "darkgreen"),
+                            "DV2_AUC"= c("white", "darkgreen"),
+                            "DV3_AUC"= c("white", "darkgreen"),
+                            "DV4_AUC"= c("white", "darkgreen"),
+                            "Breadth" = c("high" = "#FF9289", "low" = "#09DAE0")))
+    
+    colorLS <- colorAssign(inp$mat, colors = c("blue", "white", "#FF0000"), 
+                           length.vector = 100)
+    
+    
+    col_annot <- outcome_df %>%
+                  dplyr::select(PID, names(meta_dds2)[!grepl("D91", names(meta_dds2))]) %>%
+                  column_to_rownames("PID")
+    colnames(col_annot) <- gsub("p_log", "", colnames(col_annot))
+    colnames(col_annot) <- gsub("Cumulative_", "", colnames(col_annot))
+    colnames(col_annot) <- gsub("_dichot", "", colnames(col_annot))            
+    
+    
+   hm.params <- list(mat = inp$mat[row.names(inp$mat) %in% row.names(mat_p),],
+                   scale = "none",
+                   color = colorLS,
+                   cluster_rows = F,
+                   cluster_cols = F,
+                    annotation_row = mat_p[c("Breadth_logp",
+                                             rev(colnames(mat_p)[grepl("DV", colnames(mat_p))]))],
+                   #annotation_col = col_annot,
+                   annotation_col = col_annot["Breadth"],
+                   annotation_colors = logp_annot_color,
+                   show_colnames = F,
+                   cellwidth = 8,
+                   cellheight = 8,
+                   fontsize = 6,
+                   height = 12,
+                   width = 10,
+                   main = x,
+                   filename = file.path(figureDir, "functional_DEG_heatmaps",
+                                        paste("DV3_DEGs_", x, ".pdf", sep = "")))
+   
+   if(x == "MERGED"){
+     #h 
+
+     
+     gaps <- inp$stats %>%
+                            filter(hgnc_symbol %in% outcome_intersect) %>%
+                            filter(hgnc_symbol %in% row.names(inp$mat)) %>%
+                            mutate(row_n = row_number()) %>%
+                    group_by(class) %>%
+                    mutate(class_row = row_number()) %>%
+                    mutate(class_max = max(class_row)) %>%
+                    #mutate(gap = class_max + row_n) %>%
+                    ungroup() %>%
+                    filter(class_max == class_row) %>%
+                    .$row_n %>%
+                    unique()
+     
+     hm.params[["gaps_row"]] <- gaps
+     #return(gaps)
+     mat_p <- mat_p %>%
+              rownames_to_column("hgnc_symbol") %>%
+              inner_join(., inp$stats %>%
+                               dplyr::select(hgnc_symbol, class), by = "hgnc_symbol") %>%
+              column_to_rownames("hgnc_symbol")
+      # hm.params[["annotation_row"]] <-  mat_p[c("class","Breadth_logp",
+      #                                        rev(colnames(mat_p)[grepl("DV", colnames(mat_p))]))]
+      hm.params[["annotation_row"]] <-  mat_p["class"]
+   }
+   #return(hm.params$gaps_row)
+    hm <- do.call("pheatmap", hm.params)
+    
+    return(list("hm" = hm, "mat" = inp$mat[row.names(inp$mat) %in% row.names(mat_p),]))
+  }
+})
+
+
+
+
+
+
+# uniprot_db <- UniProt.ws(9606)
+# 
+# 
+# prot <-  getBM(attributes= c("hgnc_symbol","ensembl_gene_id", "go_id", "name_1006", "namespace_1003"),
+#                   filters = 'ensembl_gene_id', values = unique(all_ids$ensembl_gene_id), mart = mart)
+# 
+# test <- UniProt.ws::select(uniprot_db, keys = all_ids$ensembl_gene_id, 
+#                            columns = c("ENSEMBL_GENOMES", "UNIPROTKB"),
+#                    kt = "ENSEMBL_GENOMES")
+
+inflammasome_genes <- sapply(names(meta_dds2),simplify = F, USE.NAMES = T, function(x){
+   df <- meta_dds2[[x]]$res %>%
+                        as.data.frame() %>%
+                        rownames_to_column("ensembl_gene_id") %>%
+                        inner_join(., all_ids, by = "ensembl_gene_id") %>%
+                        filter(hgnc_symbol %in% inflamm_genes) #%>%
+                        #filter(pvalue < 0.25)
+  
+})
+                             
+
+smad_ledge <- module_split$Immune %>% 
+              filter(grepl("SMAD", pathway)) %>% 
+              separate_rows(leadingEdge, sep = ", ") %>%
+              .$leadingEdge %>%
+              unique() 
+              
+
+il10_ledge <- module_split$Immune %>% 
+              filter(grepl("IL10", pathway)) %>% 
+              separate_rows(leadingEdge, sep = ", ") %>%
+              .$leadingEdge %>%
+              unique() 
+
+
+
+cytok_matr <- combat_corr_filt[combat_corr_filt$hgnc_symbol %in% c("CXCL13"),]
+write_tsv(cytok_matr, path = "output/data/CXCL13_expr_mat.tsv")
+
+```
+
+
+```{r antiviral IFN }
+antiviral_genes <- read.csv("~/Downloads/SatishRF.csv", header = F)
+
+antiviral_isg_viruses <- read_excel("input/schoggins_immun_antiv_isg_2011.xlsx", sheet = "Sheet1") %>%
+                        mutate(`Targeted viruses` = gsub("[[]enhances.*", "", 
+                                                         `Targeted viruses`)) %>%
+                        mutate(`Targeted viruses` = gsub("[(]r[)]", "", `Targeted viruses`)) %>%
+                        mutate(`Targeted viruses` = gsub("[(]v[)]", "", `Targeted viruses`)) %>%
+                        mutate(`Targeted viruses` = gsub("[*]", "", `Targeted viruses`)) %>%
+                        separate_rows(`Targeted viruses`, sep = ", ") %>%
+                        mutate(flavivirus_class = ifelse(`Targeted viruses` %in% c("YFV", "CHIKV",
+                                                                             "DENV", "WNV",
+                                                                             "JEV"),
+                                                   "Flavivirus", "NO")) %>%
+                        mutate(flavivirus_class = ifelse(`Targeted viruses` == "DENV",
+                                                   "DENV", flavivirus_class)) %>%
+                        group_by(`Gene symbol`) %>%
+                        mutate(n_flavi = sum(flavivirus_class == "Flavivirus" )) %>%
+                        mutate(n_dv = sum(flavivirus_class == "DENV" )) %>%
+                        mutate(flavivirus = ifelse(n_flavi > 0, "Flavivirus", "NO")) %>%
+                        mutate(flavivirus = ifelse(n_dv > 0, "DENV", flavivirus)) %>%
+                        dplyr::select(`Gene symbol`, flavivirus) %>%
+                        unique()
+  
+antiviral_isg <- read_excel("input/schoggins_immun_antiv_isg_2011.xlsx", sheet = "Sheet1") %>%
+                    dplyr::select(`Gene symbol`) %>%
+                    left_join(., antiviral_isg_viruses, by = "Gene symbol") %>%
+                    dplyr::rename(Gene_symbol = `Gene symbol`) %>%
+                    mutate(Gene_symbol = gsub(" [(].*", "", Gene_symbol)) %>%
+                    mutate(root = sub("/.*", "", Gene_symbol)) %>%
+                    mutate(root = gsub('.{1}$', "", root)) %>%
+                    mutate(root = paste(paste(", ", root, sep = ""))) %>%
+                    group_by(Gene_symbol) %>%
+                    mutate(Gene_symbol_mod = gsub("[/]", root, Gene_symbol)) %>%
+                    ungroup() %>%
+                    dplyr::select(-Gene_symbol, -root) %>%
+                    dplyr::rename(Gene_symbol = Gene_symbol_mod) %>%
+                    separate_rows(Gene_symbol, sep = ", ")
+antiviral_isg
+
+
+
+```
+
+
+
+```{r }
+
+total_t1_IFN_genes <- data.frame(ensembl_gene_id = geneIds(getGmt(geneset_list_combined$interferome))["IFN_DB_TYPE_I"][[1]]) %>%
+  inner_join(., all_ids, by = "ensembl_gene_id")
+
+ifn_ledge <- merge_gs_breadth_df %>%
+              filter(pathway ==  "Type I IFN interferome") %>%
+              unnest(leadingEdge) %>%
+              inner_join(., all_ids, by = c("leadingEdge" = "ensembl_gene_id"))
+              
+  
+avg <- intersect(antiviral_genes$V1, ifn_ledge$hgnc_symbol)  
+
+writeLines(avg, con = "output/data/anvirial_ifn_genes.txt")
+
+
+
+
+test <- fisher_overlap(gene_list1 =  antiviral_genes$V1,
+                       gene_list2 = ifn_ledge$hgnc_symbol,
+                       total_genes = total_t1_IFN_genes$hgnc_symbol)
+
+test <- intersect(macro_tonic$Sensitive$hsapiens_homolog_associated_gene_name, ifn_ledge$hgnc_symbol)  
+test <- intersect(macro_tonic$Insensitive$hsapiens_homolog_associated_gene_name, ifn_ledge$hgnc_symbol)  
+test <- intersect(bcell_tonic$Sensitive$hsapiens_homolog_associated_gene_name, ifn_ledge$hgnc_symbol)  
+
+```
+
+
+```{r secreted_annot}
+all_ids
+
+ mart = useMart("ensembl", dataset="hsapiens_gene_ensembl")
+signalp <-  getBM(attributes= c("hgnc_symbol","ensembl_gene_id", "signalp"),
+                  filters = 'ensembl_gene_id', values = unique(all_ids$ensembl_gene_id), mart = mart)
+go_terms <-  getBM(attributes= c("hgnc_symbol","ensembl_gene_id", "go_id", "name_1006", "namespace_1003"),
+                  filters = 'ensembl_gene_id', values = unique(all_ids$ensembl_gene_id), mart = mart)
+
+signal_p_annot <- signalp %>%
+                  #filter(signalp != "") %>%
+                  mutate(has_signal_peptide = ifelse(signalp != "", 1, 0)) %>%
+                  mutate(has_transmembrane_domain = NA) %>%
+                  mutate(has_transmembrane_domain = ifelse(grepl("-TM",signalp), 1, has_transmembrane_domain)) %>%
+                  mutate(has_transmembrane_domain = ifelse(grepl("-noTM",signalp), 0, has_transmembrane_domain)) %>%
+                  group_by(ensembl_gene_id) %>%
+                  mutate(distinct = n_distinct(has_transmembrane_domain, na.rm = TRUE)) %>%
+                  # mutate(signalp_code = ifelse(has_signal_peptide == 0, 0, 1)) %>%
+                  # mutate(trans_code = NA) %>%
+                  # mutate(trans_code = ifelse(has_transmembrane_domain == "yes", 1, trans_code)) %>%
+                  # mutate(trans_code = ifelse(has_transmembrane_domain == "no", 0, trans_code)) %>%
+                  mutate(has_transmembrane_domain = ifelse(n_distinct(has_transmembrane_domain) > 1,
+                                                           min(has_transmembrane_domain, na.rm = TRUE),
+                                                           has_transmembrane_domain )) %>%
+                  mutate(has_signal_peptide = ifelse(n_distinct(has_signal_peptide) > 1, 
+                                                     max(has_signal_peptide, na.rm = TRUE),
+                                                     has_signal_peptide )) %>%
+                  dplyr::select(-signalp, -distinct) %>%
+                  unique(.)
+                  
+
+
+extracellular_ids <- c("extracellular region" , "extracellular space", "secretory granule" , "extracellular vesicle" , 
+                       "secretory vesicle" , "extracellular matrix" )
+
+go_terms_annot <- go_terms %>%
+                filter(namespace_1003 == "cellular_component") %>%
+                filter(name_1006 %in% extracellular_ids) %>%
+                group_by(ensembl_gene_id) %>%
+                summarise(GO_IDS_EXTRACELLULAR = paste(go_id, collapse = ";"),
+                          GO_ACCESSION_EXTRACELLULAR = paste(name_1006, collapse = ";")) %>%
+                
+
+extracellular_merged <- signal_p_annot %>%
+                        left_join(.,go_terms_annot, by = "ensembl_gene_id") %>%
+                        mutate(signalp_go_combined = ifelse(has_transmembrane_domain == 0 & !is.na(GO_IDS_EXTRACELLULAR),
+                                                            "extracellular", "cell_bound")) %>%
+                        dplyr::select(-hgnc_symbol)
+
+write.table(extracellular_merged, file.path(dataOutDir, "extracellular_annotations.csv"))
+
+```
+
+
+```{r gene_matrix}
+
+mart = useMart("ensembl", dataset="hsapiens_gene_ensembl")
+all_ids <-  getBM(attributes= c("hgnc_symbol","ensembl_gene_id"),
+                  filters = 'ensembl_gene_id', values = row.names(combat_corr_filt), mart = mart)
+
+
+topTable_select <- meta_dds2$Cumulative_Breadth_dichot$res %>%
+                  as.data.frame() %>%
+                  rownames_to_column('ensembl_gene_id') %>%
+                  inner_join(., all_ids, by = "ensembl_gene_id") %>%
+                  group_by(hgnc_symbol) %>%
+                  mutate(top = ifelse(max(baseMean) == baseMean, 1, 0)) %>%
+                  ungroup() %>%
+                  filter(top == 1 ) %>%
+                  column_to_rownames("hgnc_symbol") 
+
+combat_corr_filt <- combat_corr %>%
+                    as.data.frame(.) %>%
+                    rownames_to_column("EnsID") %>%
+                    gather(filename, value, -EnsID) %>%
+                    left_join(.,rownames_to_column(pData), by = c("filename" = "rowname")) %>%
+                    filter(EnsID %in% topTable_select$ensembl_gene_id) %>%
+                    group_by(PID) %>%
+                    mutate(n_sample = n_distinct(filename)) %>%
+                    ungroup() %>%
+                    mutate(filter_tag = ifelse(n_sample == 2 & Batch == 2, 0, 1)) %>%
+                    filter(filter_tag == 1) %>%
+                    dplyr::select(EnsID, PID, value) %>%
+                    unique() %>%
+                     #group_by(hgnc_symbol, PID) %>%
+                    
+                    # summarise(mean = mean(value)) %>%
+                    spread(PID,value) %>%
+                    inner_join(.,all_ids, by = c("EnsID" = "ensembl_gene_id")) %>%
+                    filter(hgnc_symbol != "") %>%
+                    dplyr::select(EnsID, hgnc_symbol, everything())
+
+write_tsv(combat_corr_filt, path = file.path(dataOutDir,"batch_corrected_rlog_gene_matrix.txt"), quote = FALSE)
+
+deseq2_export <- sapply(names(meta_dds2), simplify = FALSE, USE.NAMES = TRUE, function(x){
+  out <- as.data.frame(meta_dds2[[x]]$res) %>%
+    rownames_to_column("ensembl_gene_id") %>%
+    arrange(pvalue) %>%
+    inner_join(.,all_ids, by = "ensembl_gene_id") %>%
+    filter(hgnc_symbol != "")
+  return(out)
+})
+
+writexl::write_xlsx(deseq2_export, path = file.path(dataOutDir,"DESEQ2_stats.xlsx"))
+
+
+
+all_ids_names <-  getBM(attributes= c("hgnc_symbol","ensembl_gene_id", "description"),
+                  filters = 'ensembl_gene_id', values = unique(all_ids$ensembl_gene_id), mart = mart)
+
+deseq2_export_extracellular <- sapply(names(meta_dds2), simplify = FALSE, USE.NAMES = TRUE, function(x){
+  out <- as.data.frame(meta_dds2[[x]]$res) %>%
+    rownames_to_column("ensembl_gene_id") %>%
+    arrange(pvalue) %>%
+    inner_join(.,all_ids, by = "ensembl_gene_id") %>%
+    left_join(.,extracellular_merged, by ="ensembl_gene_id") %>%
+    mutate(has_signal_peptide = ifelse(is.na(has_signal_peptide), 0, has_signal_peptide)) %>%
+    mutate(has_transmembrane_domain = ifelse(is.na(has_transmembrane_domain) , "undecided", has_transmembrane_domain)) %>%
+    mutate(signalp_go_combined = ifelse(is.na(signalp_go_combined), "cell_bound", signalp_go_combined)) %>%
+    filter(hgnc_symbol != "")
+  return(out)
+})
+
+writexl::write_xlsx(deseq2_export_extracellular, path = file.path(dataOutDir,"DESEQ2_stats_extracellular.xlsx"))
+
+
+
+```
+
+
+```{r baseline_PCA}
+
+pvca_func <- function(eset, batch.factors, threshold){
+  pvca <- pvcaBatchAssess(eset, batch.factors = batch.factors, threshold = threshold)
+  df <- data.frame("Prop_var" = pvca$dat[1,], "condition" = pvca$label) %>%
+          arrange(desc(Prop_var))
+  p <- ggplot(df, aes(x = reorder(condition,Prop_var), y = Prop_var)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Condition",
+         y = "Proportion of variance explained") +
+    theme_bw() +
+    coord_flip()
+  out <- list("results" = df, "plot" = p)
+}
+
+
+
+pca_mat <- combat_corr_filt %>%
+                dplyr::select(-hgnc_symbol) %>%
+                unique() %>%
+                dplyr::select(., one_of(c("EnsID", outcome_df$PID))) %>%
+                column_to_rownames("EnsID")  %>%
+                as.matrix()
+
+
+
+
+pData_demo <- outcome_df %>% 
+             filter(PID %in% colnames(pca_mat) )%>%
+              left_join(., demographics, by = "PID") %>%
+              rename(Age = "AGE",
+                     Sex = "SEX") %>%
+             column_to_rownames("PID")
+
+
+
+eset_pca <- ExpressionSet(assayData = pca_mat,
+                          phenoData = AnnotatedDataFrame(pData_demo))
+
+#Perform PVCA on all samples
+pvca_all <- pvca_func(eset_pca,batch.factors = c("Sex", "Cumulative_Breadth_dichot"), threshold = 0.1 )
+
+svg("output/figures/pvca_transcriptomics.svg")
+pvca_all$plot
+dev.off()
+
+pca_func <- function(eset){
+  mat <- scale(t(exprs(eset)), center = T)
+  pca <- summary(prcomp(mat))
+  
+  importance <- pca$importance 
+  importance_df <- t(importance) %>%
+                    as.data.frame() %>%
+                    rownames_to_column("PC") 
+  
+  elbow <- findElbowPoint(importance_df$`Standard deviation`^2)
+  #elbow <- colnames(importance)[findElbowPoint(importance_df$`Standard deviation`^2)]
+  
+  #elbowPC <- colnames(importance)[]
+  
+  holm <- parallelPCA(mat)$n
+  
+  scree <- ggplot(importance_df, aes(x = reorder(PC,-`Proportion of Variance`) , y = `Proportion of Variance` )) + 
+            geom_bar(stat = "identity") +
+            geom_point(data = importance_df, aes(x = reorder(PC,-`Proportion of Variance`), 
+                                                 y = `Cumulative Proportion`),
+                       size = 0.5) +
+            stat_smooth(data = importance_df, aes(x = reorder(PC,-`Proportion of Variance`), 
+                                                 y = `Cumulative Proportion`), method = "loess") + 
+            #geom_smooth(data = importance_df, aes)
+            geom_vline(xintercept =  elbow, linetype = "dashed") + 
+            geom_vline(xintercept =  holm, linetype = "dashed") + 
+            geom_text(aes(elbow - 2, 0.75, label = "Elbow", vjust = -1)) + 
+            geom_text(aes(holm + 2, 0.75, label = "Holm", vjust = -1)) + 
+            theme_bw() +
+            theme(axis.text.x = element_text(angle = 90 ))
+  
+  
+
+  pca_df <- pca$x %>%
+            as.data.frame() %>%
+            rownames_to_column("SampleID") %>%
+            inner_join(., pData(eset) %>% rownames_to_column("SampleID"), by  = "SampleID") %>%
+            dplyr::select(colnames(pca$x), SampleID, everything())
+  
+  out <- list("pca_df" = pca_df, "importance" = importance, "scree" = scree, "loadings" = pca$rotation)
+
+  return(out)
+}
+
+pca_pairplot <- function(pca_object, dims = c(1:3), color  = "condition" ){
+  
+  pca_df <- pca_object$pca_df
+  p <- ggpairs(data = pca_df, columns = dims, aes_string(colour = color), 
+             showStrips = F,
+             upper = list(continuous = "blank", combo = "blank"),
+             lower = list(combo = wrap("box_no_facet", alpha=1), continous = "points"),
+             diag = list(discrete = "blankDiag"),
+             legend = 1,
+             cardinality_threshold = length(unique(pca_df[[color]])),
+             switch = "y") +
+             theme_bw()
+  return(p)
+  
+}
+
+
+
+pca_plot <- function(pca_object, color = NULL, shape = NULL, size = NULL, dims = c(1,2),
+                     title = NULL){
+   pca_df <- pca_object$pca_df
+
+    p <- ggplot(data = pca_df, 
+                aes_string(colnames(pca_df)[dims[1]],
+                           colnames(pca_df)[dims[2]],
+                           colour = color,
+                           shape = shape,
+                           size = size)) +
+            geom_point() + 
+            xlab(paste(colnames(pca_df)[dims[1]], " (",
+                       round(pca_object$importance[2,dims[1]], digits = 4) * 100,
+                       ") %", sep = "")) +  
+            ylab(paste(colnames(pca_df)[dims[2]], " (",
+                       round(pca_object$importance[2,dims[2]], digits = 4) * 100,
+                       ") %", sep = "")) + 
+             theme_bw()  +
+            ggtitle(title)
+  return(p)
+}
+
+pca_unsupervised <- pca_func(eset_pca)
+
+pdf(file = "output/figures/screeplot_unsupervised_pca_RNA-seq.pdf")
+pca_unsupervised$scree
+dev.off()
+
+pca_plots_unsup <- list()
+for(i in colnames(outcome_df)[c(5:8)]){
+    mix <- paste(i, "_vs_", "Age", sep = "")
+    pca_plots_unsup[[mix]] <- pca_plot(pca_unsupervised, color = i, 
+                                       size = "Age", title = mix, shape = "Sex" )
+}
+  
+for(i in colnames(outcome_df)[9]){
+    mix <- paste(i, "_vs_", "Age", sep = "")
+    pca_plots_unsup[[mix]] <- pca_plot(pca_unsupervised, color = i, 
+                                       size = "Age", title = mix, shape = "Sex" )
+}
+  
+  
+pdf("output/figures/PCA_unsupervised_outcome_vs_demographics.pdf")
+pca_plots_unsup
+dev.off()
+
+
+
+```
+
+
+```{r network_metab}
+ metabolon_object <- readRDS("../Metabolon/Baseline_analysis_Metabolon/output/data/outData_D180.RDS")
+
+
+metab_gsea <- metabolon_object$fgsea$D180_Breadth$metabolism$output
+fatty_ledge <- unlist(metab_gsea[metab_gsea$pathway == "METABOLON_LONG_CHAIN_SATURATED_FATTY_ACID",]$leadingEdge) 
+
+metab_filt <- metabolon_object$inputDF %>%
+                filter(CHEMICAL_ID %in% fatty_ledge) %>%
+                dplyr::select(BIOCHEMICAL, PID, value) %>%
+                rename(feature = BIOCHEMICAL)
+
+
+
+# select_path <- c("PHONG_TNF_TARGETS_UP", 
+#                  "GSE1432_CTRL_VS_IFNG_6H_MICROGLIA_DN", 
+#                  "GSE16755_CTRL_VS_IFNA_TREATED_MAC_DN")
+
+select_path <- c("PHONG_TNF_TARGETS_UP",
+                 "GSE1432_CTRL_VS_IFNG_6H_MICROGLIA_DN",
+                 "GSE16755_CTRL_VS_IFNA_TREATED_MAC_DN",
+                 "GSE8515_CTRL_VS_IL1_4H_STIM_MAC_DN",
+                 "GSE22443_NAIVE_VS_ACT_AND_IL12_TREATED_CD8_TCELL_UP" )
+                 
+
+
+D180_cytok_filt <- EB_cytok$D180_Breadth$c2c5c7$output
+ledge_cytok <- unique(unlist(D180_cytok_filt[D180_cytok_filt$pathway %in% select_path,]$leadingEdge))
+
+mart = useMart("ensembl", dataset="hsapiens_gene_ensembl")
+temp_id <-  getBM(attributes= c("hgnc_symbol","ensembl_gene_id"),
+                  filters = 'ensembl_gene_id', values = ledge_cytok, mart = mart)
+
+all_ids <-  getBM(attributes= c("hgnc_symbol","ensembl_gene_id"),
+                  filters = 'ensembl_gene_id', values = row.names(combat_corr_filt), mart = mart)
+
+
+combat_corr_matr <- combat_corr_filt %>%
+                    filter(EnsID %in% ledge_cytok) %>%
+                    inner_join(.,temp_id, by=c("EnsID" = "ensembl_gene_id")) %>%
+                    ungroup(.) %>%
+                    dplyr::select(-EnsID) %>% 
+                    gather(PID,value, -hgnc_symbol) %>%
+                    rename(feature = hgnc_symbol) %>%
+                    bind_rows(metab_filt) %>%
+                    filter(!is.na(value)) %>%
+                    spread(PID, value) %>%
+                    gather(PID,value, -feature) %>%
+                    filter(feature != "") %>%
+                    mutate(count = ifelse(is.na(value), 1, 0)) %>%
+                    group_by(PID) %>%
+                    mutate(sum = sum(count)) %>%
+                    ungroup(.) %>%
+                    filter(sum == 0) %>%
+                    dplyr::select(feature,PID,value) %>%
+                    spread(PID,value) %>%
+                    column_to_rownames("feature") %>%
+                    as.matrix(.)
+
+require(Hmisc)
+require(corrplot)
+cor.matrix <- rcorr(t(combat_corr_matr), type = "spearman") 
+
+#cor.matrix <- corr.test(MSD_contrast1_matr, method = "spearman", use = "complete") 
+cor.matrix2 <- cor.matrix
+cor.matrix2$r[cor.matrix2$P > 0.05] <- 0
+
+pdf("output/figures/corrPlot_D180.pdf")
+corrplot(cor.matrix2$r, method="circle", type="upper", is.corr=TRUE,
+         col=colorRampPalette(c("blue","white","red"))(500), tl.col = "black")
+
+dev.off()
+
+cor.matrix_filt <- cor.matrix2$r
+
+network=graph_from_adjacency_matrix( cor.matrix_filt, weighted=T, mode="undirected", diag=F)
+
+library(RCy3)
+cytoscapePing()
+createNetworkFromIgraph(network,"myIgraph")
+
+
+
+
+
+library(RColorBrewer)
+coul = brewer.pal(nlevels(as.factor(mtcars$cyl)), "Set2")
+# Map the color to cylinders
+my_color=coul[as.numeric(as.factor(mtcars$cyl))]
+ 
+# plot
+par(bg="white", mar=c(0,0,0,0))
+set.seed(4)
+plot(network, 
+    vertex.size=12,
+    vertex.color=my_color, 
+    vertex.label.cex=0.7,
+    vertex.label.color="black",
+    vertex.frame.color="transparent"
+    )
+
+
+```
+
+
+
+```{r }
+interferome_symb <- getGmt("~/Documents/GMT_files/interferome.isg.gmt")
+
+total_genes_interf <- unique(unlist(geneIds(interferome_symb)))
+
+mart = useMart("ensembl", dataset="hsapiens_gene_ensembl")
+temp_id_interf <-  getBM(attributes= c("hgnc_symbol","ensembl_gene_id"),
+                  filters = 'hgnc_symbol', values = total_genes_interf, mart = mart)
+
+
+interferome_symb_post <- interferome_symb
+for(i in 1:length(interferome_symb)){
+  setName(interferome_symb_post[[i]]) <- paste("IFN_DB_TYPE_", names(interferome_symb)[[i]], sep = "")
+  geneIDs_pre <- data.frame("hgnc_symbol" = geneIds(interferome_symb_post)[[i]]) %>%
+                    inner_join(.,temp_id_interf, by = "hgnc_symbol") %>%
+                    filter(ensembl_gene_id != "") %>%
+                    unique(.) %>%
+                    .$ensembl_gene_id
+  geneIds(interferome_symb_post[[i]]) <- geneIDs_pre
+}  
+                    
+toGmt("~/Documents/GMT_files/interferome.isg_ENS.ID.gmt",x = interferome_symb_post)  
+```
+
+```{r export norm_counts_for_cibersort}
+
+norm_counts <- counts(meta_dds2$Cumulative_Breadth_dichot$dds, normalized = TRUE) %>%
+                as.data.frame(.) %>%
+                rownames_to_column("ensembl_gene_id") %>%
+                inner_join(.,all_ids, by = "ensembl_gene_id") %>%
+                
+                gather(sample, value, -ensembl_gene_id, -hgnc_symbol) %>%
+                group_by(hgnc_symbol, sample) %>%
+                mutate(mean = mean(value)) %>%
+                dplyr::select(-ensembl_gene_id, -value) %>%
+                unique(.) %>%
+                spread(sample, mean) %>%
+                dplyr::rename(GeneSymbol = "hgnc_symbol") %>% 
+                filter(GeneSymbol != "") %>%
+                dplyr::select(GeneSymbol, everything())
+      
+batch1_samples <- row.names(colData(meta_dds2$Cumulative_Breadth_dichot$dds)[colData(meta_dds2$Cumulative_Breadth_dichot$dds)$Batch == 1,])
+
+batch2_samples <- row.names(colData(meta_dds2$Cumulative_Breadth_dichot$dds)[colData(meta_dds2$Cumulative_Breadth_dichot$dds)$Batch == 2,])
+
+norm_counts_batch1 <- norm_counts[,c("GeneSymbol", batch1_samples)]
+norm_counts_batch2 <- norm_counts[,c("GeneSymbol", batch2_samples)]
+
+write_tsv(norm_counts_batch1, "output/data/norm_counts_for_CIBERSORT_batch1.txt", quote = F)
+write_tsv(norm_counts_batch2, "output/data/norm_counts_for_CIBERSORT_batch2.txt", quote = F)
+
+
+write_tsv(norm_counts, "output/data/norm_counts_for_CIBERSORT.txt", quote = F)
+
+# read.table("~/Documents/RPS_Case/Collaborations/KazuraDent_Malaria/RNAseq/2ndrun/output/cibersort/B.exprs.txt", header = T, sep = "\t")
+
+
+cibersort_mat_select <- read.table("~/Documents/CIBERSORT/LM22.txt", sep = "\t", header = T ) %>%
+                        gather(population, value, -Gene.symbol) %>%
+                        filter(!grepl("Macrophages", population)) %>%
+                        spread(population, value)
+
+write_tsv(cibersort_mat_select, "output/data/LM22_filt_for_CIBERSORT.txt", quote = F)
+
+
+                
+att <- as.data.frame(listAttributes(mart)) %>%
+          filter(page == "homologs")
+
+ids_nhp <- getBM(attributes= c("hgnc_symbol","ensembl_gene_id",),
+                  filters = 'ensembl_gene_id', values = d91_degs, mart = mart) #%>% 
+
+```
+
+
+
+
+```{r patient_compil}
+transc_compil <- as.data.frame(gsva_matr) %>%
+                  rownames_to_column('pathway') %>%
+                  gather(PID, value, -pathway) %>%
+                  dplyr::select(PID) %>%
+                  unique() %>%
+                  mutate(omic = 'rnaseq')
+                  
+write_tsv(transc_compil,path = file.path(dataOutDir, "transcript_patient_compil.txt"))
+
+
+```
+
+
+
+```{r esets}
+
+geneEset <- ExpressionSet(assayData = combat_corr_filt %>%
+                                        filter(hgnc_symbol %in% (module_table_breadth %>% separate_rows(leadingEdge, sep = ", ") %>% .$leadingEdge)) %>%
+                                        dplyr::select(-EnsID) %>%
+                                        column_to_rownames("hgnc_symbol") %>% as.matrix()
+                                        )
+
+
+saveRDS(geneEset, file = "output/data/gene_Eset.RDS")
+moduleEset <- ExpressionSet(assayData = gsva_matr,
+                            featureData = AnnotatedDataFrame(module_table_breadth %>%
+                                                            arrange(match(pathway, row.names(gsva_matr))) %>%
+                                                             column_to_rownames("pathway")))
+saveRDS(moduleEset, file = "output/data/module_eset.RDS")
+
+```
+
+
+```{r viral_vs_bacterial}
+
+viral_sig <- c("IFI27", "JUP", "CTSB")
+
+bact_sig <- c("HK3", "TNIP1", "GPAA1", "CTSB")
+
+
+rabillo_bact_vs_viral <- read_xls("input/ramilo_blood_blood-2006-02-002477_TableS03.xls") %>%
+                            mutate(sig_type = ifelse(`FLU/Bacteria` > 1, "Viral", "Bacterial")) %>%
+                            dplyr::select(Common, sig_type)
+
+bact_vs_vir <- combat_corr_filt %>%
+                #dplyr::filter(hgnc_symbol %in% c(viral_sig, bact_sig)) %>%
+                dplyr::filter(hgnc_symbol %in% rabillo_bact_vs_viral$Common) %>%
+                dplyr::select(-EnsID) %>%
+                column_to_rownames("hgnc_symbol") %>%
+                t() %>%
+                scale() %>%
+                t() %>%
+                as.data.frame() %>%
+                rownames_to_column("hgnc_symbol") %>%
+                gather(PID, value, -hgnc_symbol) %>%
+                #left_join(., outcome_df_mod %>% rownames_to_column("PID"), by = "PID") %>%
+                #filter(Vaccine_status == "Vaccine" & Immune_status_at_baseline == "Naive") %>%
+                group_by(hgnc_symbol) %>%
+                #mutate(scaled = scale(value)) %>%
+                ungroup() %>%
+                left_join(., rabillo_bact_vs_viral, by = c("hgnc_symbol" = "Common")) %>%
+                #mutate(sig_type = ifelse(hgnc_symbol %in% bact_sig, "bact", "viral")) %>%
+                group_by(PID, sig_type) %>%
+                summarise(aggregate = mean(value, na.rm = T)) %>%
+                ungroup() %>%
+                #spread(sig_type, aggregate) %>%
+                #mutate(score = bact - viral) %>%
+                left_join(., outcome_df_mod %>% rownames_to_column("PID"), by = "PID") %>%
+                filter(Vaccine_status == "Vaccine" & Immune_status_at_baseline == "Naive") %>%
+                ggplot(., aes(x = Cumulative_Breadth_dichot, y = aggregate)) +
+                  geom_boxplot() +
+                  stat_compare_means(method = "t.test") +
+                  facet_wrap(~sig_type)
+                
+
+
+hipc_glassifier_geneLS <- readRDS("Slim_hipc/PreVaxManuscript/Output/classifier_HIPC_geneLS.RDS")
+
+hipc_classifier_df<- combat_corr_filt %>%
+                #dplyr::filter(hgnc_symbol %in% c(viral_sig, bact_sig)) %>%
+                dplyr::filter(hgnc_symbol %in% hipc_glassifier_geneLS) %>%
+                dplyr::select(-EnsID) %>%
+                column_to_rownames("hgnc_symbol") %>%
+                t() %>%
+                scale() %>%
+                t() %>%
+                as.data.frame() %>%
+                rownames_to_column("hgnc_symbol") %>%
+                gather(PID, value, -hgnc_symbol) %>%
+                #left_join(., outcome_df_mod %>% rownames_to_column("PID"), by = "PID") %>%
+                #filter(Vaccine_status == "Vaccine" & Immune_status_at_baseline == "Naive") %>%
+                #group_by(hgnc_symbol) %>%
+                #mutate(scaled = scale(value)) %>%
+                #ungroup() %>%
+                #left_join(., rabillo_bact_vs_viral, by = c("hgnc_symbol" = "Common")) %>%
+                #mutate(sig_type = ifelse(hgnc_symbol %in% bact_sig, "bact", "viral")) %>%
+                group_by(PID) %>%
+                summarise(aggregate = mean(value, na.rm = T)) %>%
+                ungroup() %>%
+                #spread(sig_type, aggregate) %>%
+                #mutate(score = bact - viral) %>%
+                left_join(., outcome_df_mod %>% rownames_to_column("PID"), by = "PID") %>%
+                filter(Vaccine_status == "Vaccine" & Immune_status_at_baseline == "Naive")  %>%
+                gather(AUC_outcome, AUC, colnames(outcome_df_mod)[c(6:9)])
+
+breadth_hipc_classifier_plot <-   ggplot(hipc_classifier_df %>% dplyr::select(-AUC_outcome, -AUC) %>% unique(),
+                                         aes(x = Cumulative_Breadth_dichot, y = aggregate)) +
+                  geom_boxplot() +
+                  theme_classic() +
+                  stat_compare_means(method = "t.test") +
+                  xlab("Breadth") +
+                  ylab("HIPC classifier ")
+
+hipc_classificer_df_breadth <- hipc_classifier_df %>% dplyr::select(-AUC_outcome, -AUC) %>% unique()
+
+auc_aggregate_corr <- hipc_classifier_df %>%
+                      group_by(AUC_outcome) %>%
+                      do(model = cor.test(.$aggregate, .$AUC, method = "spearman")) %>%
+                      ungroup() %>%
+                      mutate(modelCoef = map(model, tidy)) %>%
+                      unnest(modelCoef)
+
+auc_hipc_classifier_plot <-   ggplot(hipc_classifier_df, aes(x = AUC, y = aggregate)) +
+                  geom_point() +
+                  #stat_compare_means(method = "t.test") 
+                  facet_wrap(~AUC_outcome)
+
+ auroc_hicp_breadth <- calculateROC(labels = as.numeric(hipc_classificer_df_breadth$Cumulative_Breadth_dichot), 
+                            predictions = hipc_classificer_df_breadth$aggregate, 
+                            AUConly = T)[1]
+   pval_hicp_breadth <- calculatePval(labels = as.numeric(hipc_classificer_df_breadth$Cumulative_Breadth_dichot), 
+                            predictions = hipc_classificer_df_breadth$aggregate, 
+                            true_value = auroc, n_perm = 1000)
+
+auroc <- calculateROC(labels = as.numeric(subject_plot_dat_obj$Response), 
+                            predictions = subject_plot_dat_obj$Score, 
+                            AUConly = T)[1]
+      pval <- calculatePval(labels = as.numeric(subject_plot_dat_obj$Response), 
+                            values = subject_plot_dat_obj$Score, 
+                            true_value = auroc, n_perm = 1000)
+
+
+                
+
+```
+
+```{r integrate metabolites_to_cytokines}
+
+
+metab_eset <- readRDS("../Metabolon/Baseline_analysis_Metabolon/output/data/metabolite_eset.RDS")
+metab_filter <- fData(metab_eset) %>%
+                as.data.frame() %>%
+                rownames_to_column("metabolite") %>%
+                dplyr::filter(p.value <= 0.25) %>%
+                .$metabolite
+
+metab_module_ledge <- fData(readRDS("../Metabolon/Baseline_analysis_Metabolon/output/data/metabolite_module_eset.RDS")) %>%
+                      as.data.frame() %>% 
+                      rownames_to_column("pathway") %>%
+                      dplyr::filter(grepl("BILE|PHOSPHATI|SPHINGO", pathway)) %>%
+                      separate_rows(leadingEdge, sep = "! ") 
+                      
+
+cytok_chemok_metab_integration <- combat_corr_filt %>%
+                                  as.data.frame() %>%
+                                  dplyr::select(-EnsID) %>%
+                                  dplyr::filter(hgnc_symbol %in% row.names(functional_deg_hm$MERGED$mat)) %>%
+                                  dplyr::filter(hgnc_symbol %in% c(geneIds(hipc_gmt_mod["CYTOKINES"])[[1]], geneIds(hipc_gmt_mod["CHEMOKINES"])[[1]])) %>%
+                                  gather(PID, gene_value, -hgnc_symbol) %>%
+                                  inner_join(., exprs(metab_eset) %>%
+                                                t() %>%
+                                                as.data.frame() %>%
+                                                rownames_to_column("PID"),
+                                             by = "PID"
+                                                ) %>%
+                                  gather(metabolite, metab_value, -hgnc_symbol, -PID, -gene_value) %>%
+                                  dplyr::filter(metabolite %in% intersect(metab_module_ledge$leadingEdge, metab_filter)) %>%
+                                  group_by(hgnc_symbol, metabolite) %>%
+                                  do(model = cor.test(.$gene_value, .$metab_value, method = "spearman")) %>%
+                                  ungroup() %>%
+                                  mutate(modelCoef = map(model, tidy)) %>%
+                                  unnest(modelCoef) %>%
+                                  mutate(adjp = p.adjust(p.value, method = "BH")) %>%
+                                  dplyr::filter(p.value < 0.05) 
+                                  
+
+ledge_table_network_cytok <- metab_module_ledge %>%
+                              dplyr::rename(source = "pathway",
+                                            target = "leadingEdge") %>%
+                              dplyr::select(-pval, -NES) %>%
+                              dplyr::filter(target %in% cytok_chemok_metab_integration$metabolite) %>%
+                              dplyr::select(source, target, everything()) %>%
+                              mutate(estimate = NA) %>%
+                              mutate(p.value = NA) %>%
+                              mutate(logp = NA) # arbitraqry value to make the pathway components stay close to the pathway nopde in force directed layout
+                              
+
+metab_intra_integration <- rcorr(t(exprs(metab_eset)[unique(cytok_chemok_metab_integration$metabolite),]))
+                                 combat_corr_filt %>%
+                                  as.data.frame() %>%
+                                  dplyr::select(-EnsID) %>%
+                                  dplyr::filter(hgnc_symbol %in% row.names(functional_deg_hm$MERGED$mat)) %>%
+                                  dplyr::filter(hgnc_symbol %in% c(geneIds(hipc_gmt_mod["CYTOKINES"])[[1]], geneIds(hipc_gmt_mod["CHEMOKINES"])[[1]])) %>%
+                                  gather(PID, gene_value, -hgnc_symbol) %>%
+                                  inner_join(., exprs(metab_eset) %>%
+                                                t() %>%
+                                                as.data.frame() %>%
+                                                rownames_to_column("PID"),
+                                             by = "PID"
+                                                ) %>%
+                                  gather(metabolite, metab_value, -hgnc_symbol, -PID, -gene_value) %>%
+                                  dplyr::filter(metabolite %in% metab_module_ledge$leadingEdge) %>%
+                                  group_by(hgnc_symbol, metabolite) %>%
+                                  do(model = cor.test(.$gene_value, .$metab_value, method = "spearman")) %>%
+                                  ungroup() %>%
+                                  mutate(modelCoef = map(model, tidy)) %>%
+                                  unnest(modelCoef) %>%
+                                  mutate(adjp = p.adjust(p.value, method = "BH")) %>%
+                                  dplyr::filter(p.value < 0.05) 
+                                  
+
+                                 
+intra_corr <- function(mat, method = "spearman", scatter = F, scale = T){
+    require(Hmisc)
+  
+    if(scale){
+      mat_in <- scale(mat)
+    } else {
+      mat_in <- mat
+    }
+    tmp <- rcorr(x = mat_in, type = method)
+    combins <- unlist(lapply(combn(colnames(mat_in), m = 2, simplify = F), function(j){
+        return(paste(j[1], j[2], sep = "_vs_"))
+    }))
+    df_out <- do.call("rbind", lapply(c("r", "P"), function(k){
+        df <- tmp[[k]] %>%
+              as.data.frame() %>%
+              rownames_to_column("source") %>%
+              gather(target, value, -source) %>%
+              mutate(type = k) %>%
+              mutate(combo = paste(source, target , sep = "_vs_")) 
+    })) %>% 
+      spread(type, value) %>%
+      dplyr::filter(combo %in% combins) %>%
+      dplyr::rename(p.value = "P",
+                    estimate = "r") %>%
+      #dplyr::select(-combo) %>%
+      dplyr::select(source, target, estimate, p.value, combo)
+    
+    out <- list("df" = df_out)
+    
+    if(scatter){
+      
+      scatter_out <- sapply(combins, simplify = F, USE.NAMES = T, function(k){
+          feats <- str_split(k, pattern = "_vs_")[[1]]
+          feats <- c("PID", feats)
+          df_scatter <- as.data.frame(mat_in) %>%
+                        rownames_to_column("PID") %>%
+                        dplyr::select(feats) %>%
+                        dplyr::rename(feat1 = feats[2],
+                                      feat2 = feats[3])
+                        #gather(feature, value, -PID) #%>%
+          p <- ggplot(df_scatter, aes(x = feat1, y= feat2 )) +
+                geom_point() +
+                theme_classic() +
+                xlab(label = feats[2]) +
+                ylab(label = feats[3]) +
+                stat_smooth(method = "lm")
+                        
+      })
+      out <- c(out, list("scatter" = scatter_out))
+    }
+    
+    return(out)
+    
+    
+}
+
+
+metab_intra_corr <- intra_corr(mat = t(exprs(metab_eset)[unique(cytok_chemok_metab_integration$metabolite),]), 
+                               scale = T,
+                               method = "spearman", scatter = T)
+
+metab_intra_corr_sig <- metab_intra_corr$df %>%
+        dplyr::filter(p.value < 0.05) %>%
+        mutate(logp = -log10(p.value) * sign(estimate)) 
+
+cytok_chemok_metab_integration_network <- cytok_chemok_metab_integration %>%
+                                  dplyr::rename(source = "hgnc_symbol",
+                                                target = "metabolite") %>%
+                                  dplyr::select(-model, -statistic, -method, -alternative, -adjp) %>%
+                                  mutate(logp = -log10(p.value) * sign(estimate)) %>%
+                                  bind_rows(ledge_table_network_cytok) %>%
+                                  bind_rows(metab_intra_corr_sig) %>%
+                                  mutate(force_dir = abs(logp))
+
+write_tsv(cytok_chemok_metab_integration_network, "output/data/cytokine_vs_metbaolite_integration_network_table.tsv")
+
+cytok_chemok_metab_integration_node <- as.data.frame(fData(metab_eset)) %>%
+                                      rownames_to_column("node") %>%
+                                      dplyr::select(node, effect_size, p.value) %>%
+                                      dplyr::rename(estimate= "effect_size") %>%
+                                      mutate(logp = -log10(p.value) * sign(estimate)) %>%
+                                      mutate(class = "METABOLITE") %>%
+                                      bind_rows(functional_degs$MERGED$Cumulative_Breadth_dichot$stats %>%
+                                                dplyr::select(hgnc_symbol, log2FoldChange, pvalue, class) %>%
+                                                mutate(logp = -log10(pvalue) * sign(log2FoldChange)) %>%
+                                                dplyr::rename(estimate = "log2FoldChange", 
+                                                              p.value = "pvalue",
+                                                              node = "hgnc_symbol")) %>%
+                                      filter(node %in% c(cytok_chemok_metab_integration_network$source,
+                                                         cytok_chemok_metab_integration_network$target))
+                                      bind_rows(data.frame("node" = unique(ledge_table_network_cytok$source),
+                                                           "estimate" = NA,
+                                                           "p.value" = NA, 
+                                                           "logp" = NA,
+                                                           "class" = "PATHWAY"))
+
+
+write_tsv(cytok_chemok_metab_integration_node, "output/data/cytokine_vs_metbaolite_integration_nodetable.tsv")
+                                        
+                                  
+
+
+
+```
+
+
+```{r export gmt IFN_modules}
+
+
+
+
+module_gsColl <- GeneSetCollection(lapply(unique(module_table_breadth$module_merged), function(x){
+    df <- module_table_breadth %>%
+          dplyr::filter(module_merged == x) %>%
+          separate_rows(leadingEdge, sep = ", ")
+    
+    gs <- GeneSet(geneIds= unique(df$leadingEdge),
+                      setName = x, 
+                      shortDescription = paste("TV003 signature module ", x, sep = ""))
+}))
+
+toGmt(module_gsColl, con = "output/data/TV003_prevaccination_module.gmt")
+
+
+antiviral_tonic_gsColl <- GeneSetCollection(list(GeneSet(geneIds = ifn_ledge_node_mod[ifn_ledge_node_mod$antiviral != "ND",]$node,
+                                                         setName = "Antiviral_ISGs DV"),
+                                                 GeneSet(ifn_ledge_node_mod[ifn_ledge_node_mod$condition == "B_MF_TONIC_Sensitive",]$node,
+                                                         setName = "Tonic Sensitive ISGs DV"),
+                                                 GeneSet(ifn_ledge_node_mod[ifn_ledge_node_mod$condition == "B_MF_TONIC_Insensitive",]$node,
+                                                         setName = "Tonic Insensitive ISGs DV"),
+                                                 GeneSet(geneIds = antiviral_isg$Gene_symbol,
+                                                         setName = "Antiviral_ISGs"),
+                                                 GeneSet(merged_tonic[merged_tonic$condition == "B_MF_TONIC_Sensitive",]$hgnc_symbol,
+                                                         setName = "Tonic Sensitive ISGs"),
+                                                 GeneSet(merged_tonic[merged_tonic$condition == "B_MF_TONIC_Insensitive",]$hgnc_symbol,
+                                                         setName = "Tonic Insensitive ISGs")))
+
+toGmt(antiviral_tonic_gsColl, con = "output/data/TV003_prevaccination_module_antivirals_tonic.gmt")
+
+```
+
+
+```{r geo_prep}
+
+batch1_file_scheme <- read_csv("GEO_submission/fastq/batch1/file_rename_schema.csv") %>%
+                      mutate(PID = unlist(str_extract_all(original, pattern = "DEN[0-9]+[AB]"))) %>%
+                      mutate(Timepoint = unlist(str_extract_all(original, pattern = "D[0-5]+"))) %>%
+                      mutate(Timepoint = gsub("D", "Day", Timepoint)) %>%
+                       mutate(Immunization = unlist(str_extract_all(original, pattern = "Shot[12]"))) %>%
+                      mutate(title = paste(PID, Timepoint, Immunization, "PBMC", sep ="_")) %>%
+                      mutate(`source name` = "PBMC",
+                             organism = "Homo sapiens",
+                             batch = "1") %>%
+                      mutate(`Sample name` = paste(PID, Timepoint, Immunization, "run1", sep ="_")) %>%
+                      dplyr::select(`Sample name`, title, PID, `source name`, organism, batch,  
+                                    Timepoint, Immunization, sample_id) %>%
+                      mutate(sample_id = as.character(sample_id)) %>%
+                      unique() %>%
+                      mutate(raw_file_1 = paste(`Sample name`, "R1.fastq.gz", sep = "_"),
+                             raw_file_2 = paste(`Sample name`, "R2.fastq.gz", sep = "_")) 
+
+batch1_fastq <- data.frame("file" = list.files("GEO_submission/fastq/batch1", 
+                                               full.names = T, recursive = T, pattern = "fq.gz$")) %>%
+                          mutate(sample_id = gsub(".*batch1.", "", gsub("_..fq.gz$", "", file))) %>%
+                          mutate(path = dirname(file ),
+                                 basename = basename(file)) %>%
+                          mutate(end = gsub(".*_", "", gsub(".fq.gz", "", basename))) %>%
+                          mutate(suffix = paste("R", end, ".fastq.gz", sep = "")) %>%
+                          inner_join(., batch1_file_scheme %>%
+                                        dplyr::select(sample_id, `Sample name`), by = "sample_id") %>%
+                          mutate(`file name` = paste(path, "/",  `Sample name`, "_", suffix, sep = "" )) %>%
+                          mutate(`file type` = "fastq",
+                                 `Instrument model` = "BGI500",
+                                 `single or paired-end` = "paired-end",
+                                 `read length` = "100")
+
+batch2_file_scheme <- read_csv("GEO_submission/fastq/batch2/file_rename_schema.csv") %>%
+                      mutate(PID = unlist(str_extract_all(original, pattern = "DEN[0-9]+[AB]"))) %>%
+                      #mutate(Timepoint = unlist(str_extract_all(original, pattern = "D[0-5]+"))) %>%
+                      mutate(Timepoint = gsub("D", "Day", Timepoint)) %>%
+                       mutate(Immunization = "Shot1") %>%
+                      mutate(title = paste(PID, Timepoint, Immunization, "PBMC", sep ="_")) %>%
+                      mutate(`source name` = "PBMC",
+                             organism = "Homo sapiens",
+                             batch = "2") %>%
+                      mutate(`Sample name` = paste(PID, Timepoint, Immunization, "run2", sep ="_")) %>%
+                      dplyr::select(`Sample name`, title, PID, `source name`, organism, batch,  
+                                    Timepoint, Immunization, sample_id) %>%
+                      mutate(sample_id = as.character(sample_id)) %>%
+                      unique() %>%
+                      mutate(raw_file_1 = paste(`Sample name`, "R1.fastq.gz", sep = "_"),
+                             raw_file_2 = paste(`Sample name`, "R2.fastq.gz", sep = "_"))  %>%
+                      bind_rows(.,batch1_file_scheme) %>%
+                      dplyr::filter(PID %in% colnames(combat_corr_filt)) %>%
+                      dplyr::filter(Timepoint == "Day0" & Immunization == "Shot1")
+
+batch2_fastq <- data.frame("file" = list.files("GEO_submission/fastq/batch2", 
+                                               full.names = T, recursive = T, pattern = "fq.gz$")) %>%
+                          mutate(sample_id = gsub(".*batch2.", "", gsub("_..fq.gz$", "", file))) %>%
+                          mutate(path = dirname(file ),
+                                 basename = basename(file)) %>%
+                          mutate(end = gsub(".*_", "", gsub(".fq.gz", "", basename))) %>%
+                          mutate(suffix = paste("R", end, ".fastq.gz", sep = "")) %>%
+                          inner_join(., batch2_file_scheme %>%
+                                        dplyr::select(sample_id, `Sample name`), by = "sample_id") %>%
+                          mutate(`file name` = paste(path, "/",  `Sample name`, "_", suffix, sep = "" )) %>%
+                          mutate(`file type` = "fastq",
+                                 `Instrument model` = "BGI500",
+                                 `single or paired-end` = "paired-end",
+                                 `read length` = "100") %>%
+                          bind_rows(.,batch1_fastq) %>%
+                          dplyr::filter(`Sample name` %in% batch2_file_scheme$`Sample name`)
+
+
+file.rename(from = batch2_fastq$file, to = batch2_fastq$`file name`)
+
+library(tools)                          
+md5_df <- data.frame(filename = list.files("GEO_submission/fastq", full.names = T, pattern = "fastq.gz$")) %>%
+            mutate(`file checksum` = md5sum(filename))
+          mutate(basename = basename(filename)) %>%
+          arrange(match(basename, (batch2_fastq %>% 
+                          mutate(basename = basename(`file name`)) %>%
+                          .$basename)))
+
+
+write_csv(md5_df, "md5_fastq_checksums.csv")
+
+write_csv(batch2_fastq %>%
+            mutate(basename_geo = basename(`file name`)), file = "GEO_submission/file_list_GEO.csv")
+                        
+write_csv(batch2_file_scheme, file = "GEO_submission/sample_list_GEO.csv")
+
+norm_counts_geo <- as.data.frame(counts(meta_dds2$Cumulative_Breadth_dichot$dds, normalized = T)) %>%
+                rownames_to_column("ensembl_gene_id") %>%
+                gather(sample_id, value, -ensembl_gene_id) %>%
+                mutate(sample_id = as.character(sample_id)) %>%
+                inner_join(., batch2_file_scheme %>%
+                              dplyr::select(sample_id, `Sample name`), by = "sample_id") %>%
+                dplyr::select(-sample_id) %>%
+                spread(`Sample name`, value, fill = 0) 
+write_csv(norm_counts_geo, file = "GEO_submission/counts/normalized_counts.csv")
+
+raw_counts_geo <- as.data.frame(counts(meta_dds2$Cumulative_Breadth_dichot$dds, normalized = F)) %>%
+                rownames_to_column("ensembl_gene_id") %>%
+                gather(sample_id, value, -ensembl_gene_id) %>%
+                mutate(sample_id = as.character(sample_id)) %>%
+                inner_join(., batch2_file_scheme %>%
+                              dplyr::select(sample_id, `Sample name`), by = "sample_id") %>%
+                dplyr::select(-sample_id) %>%
+                spread(`Sample name`, value, fill = 0) 
+write_csv(raw_counts_geo, file = "GEO_submission/counts/raw_counts.csv")
+
+counts_md5 <- data.frame("files" = list.files("GEO_submission/counts", full.names = T)) %>%
+              mutate(md5sum = md5sum(files))
+write_csv(counts_md5, file = "counts_md5.csv")
+```
+
+

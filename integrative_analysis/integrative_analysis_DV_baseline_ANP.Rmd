@@ -1,0 +1,823 @@
+---
+title: "integrative_analysis_DV_baseline"
+author: "Adam Pelletier"
+date: "5/10/2019"
+output: html_document
+---
+
+```{r setup, message = FALSE, warning=FALSE}
+#### Load required packages for analysis
+## Some packages may require installation from Bioconductor : "https://bioconductor.org/install/" 
+suppressPackageStartupMessages(library(rstudioapi))
+suppressPackageStartupMessages(library(rmarkdown))
+suppressPackageStartupMessages(library(tidyverse))
+
+suppressPackageStartupMessages(library(data.table))
+
+suppressPackageStartupMessages(library(GSEABase))
+suppressPackageStartupMessages(library(cluster))
+suppressPackageStartupMessages(library(magrittr))
+suppressPackageStartupMessages(library(gdata))
+suppressPackageStartupMessages(library(reshape2))
+suppressPackageStartupMessages(library(RColorBrewer))
+suppressPackageStartupMessages(library(mixOmics))
+suppressPackageStartupMessages(library(circlize))
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(getwd())
+```
+
+
+
+### Setup directories 
+
+``` {r dirSetup}
+setup_dir <- function(dir_string) { 
+  ### Verifies creates a directory if it doesn't exist. Returns the dir_path
+  if (dir.exists(dir_string)){
+    dir_set <- dir_string
+  } else {
+    dir.create(dir_string) 
+    dir_set <- dir_string
+  }
+  return(dir_set)
+}
+
+inputDir <- setup_dir("input")
+
+
+outputDir <- setup_dir("output")
+figureDir <- setup_dir(file.path(outputDir,"figures"))
+dataOutDir <- setup_dir(file.path(outputDir,"data"))
+
+
+```
+
+```{r load_flow}
+
+innate_flow <- read.csv("../FACS/Baseline_experiment/tSNE_2/output/innate_mixomics_export.csv")
+flow_matrix <- read.csv("../FACS/Baseline_experiment/Abdullah_baseline/output/abdullah_mixomics_table.csv") %>%
+                  dplyr::select(-X) %>%
+                  bind_rows(innate_flow) %>%
+                  spread(Annot,Freq) 
+
+flow_node_table <- read.csv("../FACS/Baseline_experiment/tSNE_2/output/innate_node_table.csv") %>%
+                mutate(border_value = 1)
+
+flow_eset <- readRDS("../FACS/Baseline_experiment/tSNE_2/output/flow_eset_innate.RDS")
+
+
+
+
+```
+
+
+```{r load_transcriptomic}
+
+trans_matrix <- read.csv("../RNA_Seq/output/data/gene_matrix_for_mixomics.csv" , row.names = 1) %>%
+                  rownames_to_column("PID")
+
+gs_node_table <- read.csv("../RNA_Seq/output/data/geneset_node_table.csv")
+gs_edge_table <- read.csv("../RNA_Seq/output/data/transcriptomic_network_table.csv") %>%
+                  mutate(edge_value = "0.01")
+
+gene_node_table <- read.csv("../RNA_Seq/output/data/gene_node_table.csv") %>% dplyr::rename(node = "hgnc_symbol")
+
+
+gene_eset <- readRDS("../RNA_Seq/output/data/gene_Eset.RDS")
+gene_module_eset <- readRDS("../RNA_Seq/output/data/module_eset.RDS")
+   
+
+fData_gene_module <- fData(gene_module_eset) %>%
+                        rownames_to_column("pathway") %>%
+                        
+                        filter(module_merged %in% c("Chemotaxis", "Humoral response", "IL1R signaling", "SMAD1", "SMAD2 SMAD3",
+                                                    "SMAD4", "TNFA signaling", "Type I IFN", "DNA Sensing", "NFKB", "RELA")) %>%
+                        
+                        group_by(module_merged) %>%
+                        mutate(logp = -log10(max(abs(pval_int))) *sign(NES)) %>%
+                        ungroup() %>%
+                        dplyr::rename(sector = "module_merged") %>%
+                         #mutate(omic_rank = dense_rank(-abs(logp))) %>%
+                         #mutate(relRank = omic_rank / n()) %>%
+                       # filter(relRank < 0.5) %>%
+                        separate_rows(leadingEdge, sep = ", ") %>%
+                        dplyr::select(sector, leadingEdge, logp) %>%
+                        mutate(omic = "transcriptomic") %>%
+                        unique()
+
+
+gene_mat <- exprs(gene_eset)[row.names(exprs(gene_eset)) %in% fData_gene_module$leadingEdge,]
+
+
+```
+
+```{r load_metabolon}
+
+metab_matrix <- read.table("../Metabolon/Baseline_analysis_Metabolon/output/data/metabolon_mixomics_ecport.csv", 
+                         sep = "!", header = TRUE) %>%
+                spread(BIOCHEMICAL, value)
+
+metabolite_set_node_table <- read.table("../Metabolon/Baseline_analysis_Metabolon/output/data/metabolon_gs_node_table.csv",
+                                        sep ="!", header = TRUE) 
+                              
+metabolite_node_table <- read.table("../Metabolon/Baseline_analysis_Metabolon/output/data/metabolon_metabolite_node_table.csv",
+                                        sep = "!", header = TRUE) %>%
+                        mutate(border_value = 1)
+
+metabolite_edge_table <- read.table("../Metabolon/Baseline_analysis_Metabolon/output/data/metabolon_gs_edge_table.csv",
+                                        sep = "!", header = TRUE) %>%
+                        mutate(edge_value = "0.01")
+   
+
+metabolite_eset <- readRDS("../Metabolon/Baseline_analysis_Metabolon/output/data/metabolite_eset.RDS")
+metabolite_module_eset <- readRDS("../Metabolon/Baseline_analysis_Metabolon/output/data/metabolite_module_eset.RDS")
+
+
+
+fData_metab_module <- fData(metabolite_module_eset) %>%
+                        rownames_to_column("sector") %>%
+                        mutate(logp = -log10(pval) *sign(NES)) %>%
+                        mutate(omic_rank = dense_rank(-abs(logp))) %>%
+                         mutate(relRank = omic_rank / n()) %>%
+                        filter(relRank < 0.5) %>%
+                        separate_rows(leadingEdge, sep = "! ") %>%
+                        dplyr::select(sector, leadingEdge, logp) %>%
+                        mutate(omic = "metabolomic")
+
+
+metab_mat <- exprs(metabolite_eset)[row.names(exprs(metabolite_eset)) %in% fData_metab_module$leadingEdge,]
+                          
+```
+
+```{r load_proteomics}
+
+prot_eset <- readRDS("../Caprion_proteomics_metab/Caprion_proteomics/output/data/prot_Eset.RDS")
+
+
+
+prot_module_set <- readRDS("../Caprion_proteomics_metab/Caprion_proteomics/output/data/module_prot_eset.RDS")
+
+fData_prot_module <- fData(prot_module_set) %>%
+                      rownames_to_column("sector") %>%
+                      filter(sector %in% c("HECKER_IFNB1_TARGETS", "GO_B_CELL_ACTIVATION", "STAT5A", "STAT5A", "STAT6")) %>%
+                      separate_rows(leadingEdge, sep = ", ") %>%
+                      mutate(leadingEdge = paste(leadingEdge, "_HUMAN", sep = "")) %>%
+                      mutate(logp = -log10(p.value) * sign(estimate)) %>%
+                      mutate(omic_rank = dense_rank(-abs(logp))) %>%
+                         mutate(relRank = omic_rank / n()) %>%
+                        filter(relRank < 0.5) %>%
+                      dplyr::select(sector, leadingEdge, logp) %>%
+                      mutate(omic = "proteomic")
+prot_mat <- exprs(prot_eset)
+row.names(prot_mat) <- paste(row.names(prot_mat), "_HUMAN", sep = "")
+prot_mat <- prot_mat [row.names(prot_mat ) %in% fData_prot_module$leadingEdge,]
+
+```
+
+
+```{r filter_on_common}
+# common_PIDs <- intersect(c(flow_matrix$PID, metab_matrix$PID), trans_matrix$PID)
+# 
+
+allmats <- list("flow" = exprs(flow_eset), "metabolon" = metab_mat, "transcriptomic" = gene_mat, "proteomics" = prot_mat)
+```
+
+
+plot(iris$Sepal.Length, iris$Sepal.Width)
+
+```{r mixomics}
+
+
+
+par(mar=c(1,1,1,1))
+
+# for every pair of omics, identify complete set of participants
+outLS <- list()
+candidateOmics <- names(allmats)
+combos <- combn(candidateOmics, m= 2, simplify = FALSE)
+
+options(device = "quartz")
+outLS <- list()
+for(i in 1:length(combos)){
+  omic1 <- combos[[i]][1]
+  omic2 <- combos[[i]][2]
+  omic1_Mat <- as.data.frame(t(allmats[[omic1]]))  %>% rownames_to_column("PID")
+  omic2_Mat <- as.data.frame(t(allmats[[omic2]])) %>% rownames_to_column("PID")
+  #PID_intersect <- intersect(omic1_Mat$PID,omic2_Mat$PID)
+  merged_Mat_filt <- omic1_Mat %>%
+                  
+                  inner_join(.,omic2_Mat, by = "PID") %>%
+                  filter(complete.cases(.))
+  omic1_Mat_filt <- merged_Mat_filt %>% 
+    dplyr::select(colnames(omic1_Mat)) %>%
+    remove_rownames(.) %>%
+    column_to_rownames("PID") %>% 
+    as.matrix(.)
+  omic2_Mat_filt <- merged_Mat_filt %>% 
+    dplyr::select(colnames(omic2_Mat)) %>%
+    remove_rownames(.) %>%
+    column_to_rownames("PID") %>% 
+    as.matrix(.)
+  
+  splsFull <- spls(omic1_Mat_filt,
+                      omic2_Mat_filt,
+                       mode  = "regression",
+                       scale = TRUE)
+  set.seed(seed = 1)
+  splsCV <- perf(splsFull,
+                     validation = "loo",
+                     progressBar = FALSE)
+  nComp <- which.max(splsCV$Q2.total)
+  keep.X <- apply(abs(splsFull$loadings$X), 1, sum) > 0
+  keep.Y <- apply(abs(splsFull$loadings$Y), 1, sum) > 0
+  cord.X <- cor(splsFull$X[, keep.X], splsFull$variates$X[, 1:nComp],
+                use = "pairwise")
+  cord.Y <- cor(splsFull$Y[, keep.Y], splsFull$variates$X[, 1:nComp],
+                use = "pairwise")
+  simFullMat <- cord.X %*% t(cord.Y)
+  rThreshold <- quantile(as.numeric(simFullMat), probs = 0.975)
+  if (rThreshold > 0) {
+      # net <- network(splsFull,
+      #              comp = 1:2,
+      #              cutoff = rThreshold)
+      outLS[[paste0(omic1, "_", omic2)]] <- network(splsFull,
+                                                 comp = 1:2,
+                                                 cutoff = rThreshold)
+  }
+}
+
+network_table_mixomics <- do.call("rbind",lapply(names(outLS), function(x){
+    output <- outLS[[x]]$M %>%
+                as.data.frame(.) %>%
+                rownames_to_column("source") %>%
+                gather(target, edge_value, -source) %>%
+                filter(edge_value != 0)
+    return(output)
+}))
+
+# 
+# write.table(merged_node_table, file = "merged_node_table.csv", sep ="!", quote = FALSE, row.names = FALSE)
+# 
+# merged_network_table_temp <- rbind(gs_edge_table, metabolite_edge_table) %>%
+#                               filter(target %in% c(network_table_mixomics$source, network_table_mixomics$target))
+# 
+# merged_network_table <- rbind(network_table_mixomics, merged_network_table_temp)
+# write.table(merged_network_table, file = "merged_network_table.csv", sep ="!", row.names = FALSE, quote = FALSE)
+# 
+# 
+# 
+# 
+# merged_node_table <- do.call("rbind", list(metabolite_set_node_table,metabolite_node_table, flow_node_table,
+#                                            gs_node_table, gene_node_table)) %>%
+#                       filter(node %in% c(merged_network_table$source,merged_network_table$target))
+# 
+# write.table(merged_node_table, file = "merged_node_table.csv", sep ="!", quote = FALSE, row.names = FALSE)
+
+```
+
+```{r colorAssign}
+
+colorAssign <- function(valueVector, scale_limits = NULL, colors = c("blue", "white", "red"), length.vector = 500, plot.scale = F, break_points = F, alpha  = 1){
+  require(scales)
+  require(pheatmap)
+  colorLS <- colorRampPalette(colors = colors)(length.vector)  
+  colorLS <- alpha(colorLS, alpha = alpha)
+  if(is.null(scale_limits)){
+    breaks <- seq(-max(abs(valueVector)), max(abs(valueVector)), length.out = length.vector)
+  } else {
+    breaks <- seq(scale_limits[1], scale_limits[2], length.out = length.vector)
+  }
+  
+  
+  minBreak <- which(abs(breaks - min(valueVector)) == min(abs(breaks - min(valueVector))))
+  maxBreak <- which(abs(breaks - max(valueVector)) == min(abs(breaks - max(valueVector))))
+  colorScale <- breaks[minBreak:maxBreak]
+  names(colorScale) <- colorLS[minBreak:maxBreak]
+  if(plot.scale == F){
+    
+    return(colorScale)
+  } else {
+    p <- pheatmap(as.matrix(rev(breaks[minBreak:maxBreak])), color = names(colorScale), cluster_rows = F, cluster_cols = F, cellwidth = 6, cell_height = 0.1, height = 4, width = 1)
+    return(list("scale" = colorScale, "plot_scale" = p ))
+  }
+  
+}
+
+
+
+```
+
+```{r circos_functions}
+
+
+
+order_sector_links <- function(sector_df, link_df, sector_width_col = "width", link_width_col = "link_width", pct.link_buffer = 0.30, h.ratio_cap = 0.7){
+  sector_df_raw <- sector_df %>%
+                    dplyr::select(sector, c(sector_width_col) ) %>%
+                    dplyr::rename(sec_width =  2) %>%
+                    mutate(rank = row_number()) %>%
+                    mutate(link_width = max(sec_width)  / (n() - 1))
+  
+
+  link_order <- sapply(sector_df_raw$sector, simplify = F, USE.NAMES = T, function(x){
+      center_df <- sector_df_raw %>%
+                  filter(sector == x)
+      max_rank = dim(sector_df_raw)[1] 
+      mid_value <- floor((max_rank)/2)
+      #return(mid_value)
+      
+      order_df <- sector_df_raw %>%
+                  filter(sector != x) %>%
+                  mutate(rank_adjusted = rank - (center_df$rank - mid_value) ) %>%
+                  mutate(rank_adjusted = ifelse(rank_adjusted > max_rank, rank_adjusted - max_rank, rank_adjusted)) %>%
+                  mutate(delta_mid = rank_adjusted - mid_value) %>%
+                  mutate(rank_final = -log(abs(delta_mid)/1000) *sign(delta_mid)) %>%
+                  arrange(rank_final) %>%
+                  .$sector
+      link_connections <- link_df %>%  dplyr::rename(point1 = 1, point2 = 2) %>%
+                            filter(point1 == x | point2 == x)
+      links <- c(link_connections$point1, link_connections$point2)
+      links <- links[links != x]
+      int <- intersect(order_df, links)
+      return(int)
+  })
+
+  out <- do.call("rbind", lapply(seq(1, dim(link_df)[1]), function(x){
+  #out <-  lapply(seq(1, dim(link_df)[1]), function(x){
+    point_names <- colnames(link_df)[c(1:2)]
+    link_df_filt <- link_df[x,] %>% dplyr::rename(point1 = 1, point2 = 2)
+    total_sectors <- dim(sector_df_raw)[1] -1 
+    
+    point1_width_total <- link_df %>% 
+                      dplyr::rename(point1 = 1, point2 = 2) %>%
+                      filter(point1 == link_df_filt$point1 | point1 == link_df_filt$point2) %>%
+                      mutate(n = n()) %>%
+                      .$n %>% unique()
+   
+    point2_width_total <- link_df %>% 
+                      dplyr::rename(point1 = 1, point2 = 2) %>%
+                      filter(point2 == link_df_filt$point1 | point2 == link_df_filt$point2) %>%
+                      mutate(n = n()) %>%
+                      .$n %>% unique()
+
+    ind1 <- which(link_order[[link_df_filt$point1]] == link_df_filt$point2)
+    #return(ind2)
+    missing_point1 <- total_sectors - length(link_order[[link_df_filt$point1]])
+    ind2 <- which(link_order[[link_df_filt$point2]] == link_df_filt$point1) 
+    missing_point2 <- total_sectors - length(link_order[[link_df_filt$point2]])
+    
+    
+    hseq_ind1 <- abs(ceiling(length(link_order[[link_df_filt$point1]]) / 2))
+    hseq_ind2 <- abs(ceiling(length(link_order[[link_df_filt$point2]]) / 2))
+    deltah1 <- abs(hseq_ind1 - ind2)
+    deltah2 <- abs(hseq_ind2 - ind1)
+    deltah <- 2
+    if(link_order[[link_df_filt$point1]][1] == link_df_filt$point2 & link_order[[link_df_filt$point2]][length(link_order[[link_df_filt$point2]])] == link_df_filt$point1){
+      h.ratio <- h.ratio_cap
+    } else if (link_order[[link_df_filt$point1]][length(link_order[[link_df_filt$point1]])] == link_df_filt$point2 & link_order[[link_df_filt$point2]][1] == link_df_filt$point1){
+      h.ratio <- h.ratio_cap
+    } else {
+      h.ratio <- 0.5
+    }
+    
+    
+    sector1_link_width_raw <- sector_df_raw[sector_df$sector == link_df_filt$point1,]$link_width
+    sector1_buffer <- sector1_link_width_raw * ( pct.link_buffer)
+    
+    sector1_link_width <- sector1_link_width_raw - sector1_buffer
+    point1_start <- (sector1_link_width + sector1_buffer) * ((missing_point1/2) + ind1)
+  
+    point1_end <-  point1_start +  sector1_link_width
+    
+    sector2_link_width_raw <- sector_df_raw[sector_df$sector == link_df_filt$point2,]$link_width
+
+    sector2_buffer <- sector2_link_width_raw * ( pct.link_buffer)
+    sector2_link_width <- sector2_link_width_raw - sector2_buffer
+    point2_start <- (sector2_link_width +sector2_buffer )* ((missing_point2/2) +ind2)
+    point2_end <-  point2_start +  sector2_link_width
+    
+
+    out_df <- link_df_filt %>% bind_cols(data.frame("point1_start" = point1_start, "point1_end" = point1_end,
+                                                    "point2_start" = point2_start, "point2_end" = point2_end,
+                                                    "point1_width" = sector_df_raw[sector_df$sector == link_df_filt$point1,]$sec_width / point1_width_total,
+                                                    "point2_width" = sector_df_raw[sector_df$sector == link_df_filt$point2,]$sec_width / point2_width_total,
+                                                    "h_ratio" = h.ratio))          
+    colnames(out_df)[c(1:2)] <- point_names
+    return(out_df)
+  #})
+  }))
+  
+}
+
+
+```
+
+
+```{r module_df}
+
+
+selected_sectors <- do.call("rbind", list(fData_gene_module, fData_metab_module, fData_prot_module)) %>%
+                      group_by(sector, omic) %>%
+                      mutate(n_ledge = n()) %>%
+                      ungroup() %>%
+                      bind_rows(., fData(flow_eset) %>%
+                                    rownames_to_column("sector") %>%
+                                    mutate(leadingEdge = sector) %>%
+                                    mutate(logp = -log10(p.value) * sign(estimate),
+                                           omic = "Flow",
+                                           n_ledge = 1) %>%
+                                    dplyr::select(sector, leadingEdge, logp, omic, n_ledge)
+                                    ) %>%
+                      group_by(sector, omic) %>%
+                      #mutate(n_ledge = n()) %>%
+                      #ungroup() %>%
+                      filter(leadingEdge %in% c(network_table_mixomics$source, network_table_mixomics$target)) %>%
+                      group_by(sector, omic) %>%
+                      mutate(n_select = n()) %>%
+                      mutate(relFreq = n_select / n_ledge) %>%
+                      ungroup() %>%
+
+                      unique() %>%
+                      filter(relFreq > 0.50) #%>%
+                     #
+
+
+
+link_df_tmp <- network_table_mixomics %>%
+            inner_join(., selected_sectors %>% dplyr::select(sector, leadingEdge), by = c("source" = "leadingEdge")) %>%
+            dplyr::rename(point1 = "sector") %>%
+            inner_join(., selected_sectors %>% dplyr::select(sector, leadingEdge), by = c("target" = "leadingEdge")) %>%
+            dplyr::rename(point2 = "sector") #%>%
+
+
+link_df_tmp2 <- do.call("rbind", lapply(combn(unique(c(link_df_tmp$point1, link_df_tmp$point2)), simplify = F, m = 2), function(x){
+  df_raw <- link_df_tmp[link_df_tmp$point1 %in% x & link_df_tmp$point2 %in%x ,]
+  # link2 <- link_df_tmp[link_df_tmp$point2 == x[1] & link_df_tmp$point1 == x[2],]
+  # df_raw <- rbind(link1, link2)
+  
+  
+  if(dim(df_raw)[1] <= 2){
+    return(NA)
+  } else {
+    point1_df <- df_raw[df_raw$point1 == x[1] | df_raw$point2 == x[1],] %>% mutate(feature = ifelse(point1 == x[1], source, target))
+    point2_df <- df_raw[df_raw$point1 == x[2] | df_raw$point2 == x[2],] %>% mutate(feature = ifelse(point1 == x[2], source, target))
+    #return(point1_df)
+    out <- data.frame("point_1" = x[1], "point_2" =  x[2], "link_value" = median(df_raw$edge_value), 
+                      "n_pos" = dim(df_raw[df_raw$edge_value > 0,])[1], "n_neg" = dim(df_raw[df_raw$edge_value < 0,])[1],
+                      "point1_n" = length(unique(point1_df$feature)), "point2_n" = length(unique(point2_df$feature)))
+    return(out)
+  }
+  
+})) %>%
+  filter(!is.na(point_1)) %>%
+  mutate(point_1 = as.character(point_1),
+         point_2 = as.character(point_2)) %>%
+  mutate(freq_p = n_pos / (n_pos + n_neg)) %>%
+  filter(freq_p <= 0.2 | freq_p >= 0.8)
+
+
+rename_df <- data.frame("internal_name" = unique(c(link_df_tmp2$point_1, link_df_tmp2$point_2))) %>% mutate(new_name = "")
+writexl::write_xlsx(rename_df, path = "output/data/sector_rename.xlsx")
+
+rename_df_upd <- readxl::read_xlsx("output/data/sector_rename_upd.xlsx")
+
+
+link_df <- link_df_tmp2 %>%
+            inner_join(., rename_df_upd, by = c("point_1" = "internal_name")) %>%
+            #dplyr::select(-point_1) %>%
+            dplyr::rename(point1_internal_name = "point_1", point_1 = "new_name") %>%
+            inner_join(., rename_df_upd, by = c("point_2" = "internal_name")) %>%
+            #dplyr::select(-point_2) %>%
+            dplyr::rename(point2_internal_name = "point_2",point_2 = "new_name") %>%
+            dplyr::select(point_1, point_2, link_value, point1_internal_name, point2_internal_name) %>%
+            remove_rownames()
+
+
+sector_df <- data.frame("internal_name" =  unique(c(link_df$point1_internal_name, link_df$point2_internal_name)))  %>%
+              inner_join(., selected_sectors, by = c("internal_name" = "sector")) %>%
+              dplyr::select(-leadingEdge) %>% unique() %>%
+              inner_join(., rename_df_upd, by = "internal_name") %>%
+              mutate(sector_width = 100) %>%
+              dplyr::rename(sector = "new_name") %>%
+              dplyr::select(sector, logp, omic, internal_name, sector_width) %>%
+              mutate(direction = sign(logp)) %>%
+              arrange(direction, omic, abs(logp))
+
+
+omic_colors <- brewer.pal(8,"Accent")[c(1:4)]
+names(omic_colors ) <- levels(as.factor(sector_df$omic))
+
+sector_df <-  sector_df %>% inner_join(., data.frame(omic_colors) %>%
+                                    rownames_to_column("omic"), by = "omic" )
+
+sector_colors <- colorAssign(sector_df$logp, plot.scale = T)
+sector_colors_assign <- unlist(lapply(sector_df$logp, function(x){
+
+  col_ind <- which.min(abs(sector_colors$scale - x)) 
+  return(names(sector_colors$scale[col_ind]))
+  
+}))
+
+sector_df$color <- sector_colors_assign       
+
+pdf("output/figures/sector_color_scale.pdf")
+sector_colors$plot_scale
+dev.off()
+
+n_connections <- unlist(lapply(sector_df$sector, function(x){
+  filt <- link_df[link_df$point_1 == x | link_df$point_2 == x,]
+  #return(filt %>% mutate(filt = x))
+  n_connections <- length(unique(c(filt$point_1, filt$point_2))) - 1
+  
+}))
+
+sector_df$sector_width <- n_connections/max(n_connections) * 100
+
+
+ 
+link_df <- order_sector_links(sector_df = sector_df, link_df = link_df, sector_width_col = "sector_width", h.ratio_cap = 0.6)   
+
+link_color <- colorAssign(link_df$link_value, plot.scale = T, alpha = 0.5)
+link_colors_assign <- unlist(lapply(link_df$link_value, function(x){
+
+  col_ind <- which.min(abs(link_color$scale - x)) 
+  return(names(link_color$scale[col_ind]))
+  
+}))
+
+link_df$color <- link_colors_assign
+
+pdf("output/figures/link_color_scale.pdf")
+link_color$plot_scale
+dev.off()
+
+
+```
+
+
+```{r circosPlot}
+
+
+pdf("output/figures/integrated_circos_DV.pdf", width = 9)
+
+circos.par("track.height" = 0.1, "gap.degree" = 1, 
+           circle.margin = c(1,1,3,1),
+           cell.padding = c(0.02, 0, 0.02, 0))
+circos.initialize(sector_df$sector, xlim = c(0,max(sector_df$sector_width)),
+                  sector.width = sector_df$sector_width)
+
+circos.track(sector_df$sector, bg.col = sector_df$color, ylim = c(0,1),
+             panel.fun = function(x, y) {
+               circos.text(CELL_META$xcenter, 
+                           CELL_META$cell.ylim[1] + mm_y(5), 
+                           CELL_META$sector.index,
+                           facing = "clockwise",
+                           niceFacing = T ,
+                           cex = 0.4,
+                           adj = c(0.05, degree(0)))
+                          
+})
+
+circos.track(sector_df$sector, ylim = c(0,1),
+             bg.col = as.character(sector_df$omic_colors ))
+
+
+lapply(seq(1:dim(link_df)[1]), function(x){
+  df <- link_df[x,]
+  #m_path_df <- sector[metab_integration_filt$sector == df$metab_pathway,]
+
+
+  circos.link(sector.index1 = df$point_1,
+              point1= c(df$point1_start, df$point1_end),
+              sector.index2 = df$point_2, point2 = c(df$point2_start, df$point2_end), col = df$color, lty = 1, lwd = 0.1, h.ratio = df$h_ratio )
+
+
+})
+
+# chords_df <- metab_links_filt[,c("metab_pathway", "transc_pathway", "point1_width", "point2_width")]
+# 
+# chordDiagram(x = chords_df)
+
+
+dev.off()
+
+
+
+
+
+```
+
+
+
+
+
+
+
+```{r load_flow_select}
+
+flow_matrix_select <- read.csv("../FACS/Baseline_experiment/tSNE_2/output/innate_mixomics_export_filt.csv") %>%
+                spread(Annot,Freq) 
+
+flow_node_table_select <- read.csv("../FACS/Baseline_experiment/tSNE_2/output/innate_node_table_filt.csv") %>%
+                  mutate(border_value = 1)
+
+    
+
+```
+
+
+```{r load_transcriptomic_select}
+
+trans_matrix_select <- read.csv("../RNA_Seq/output/data/gene_matrix_for_mixomics_select.csv" , row.names = 1) %>%
+                  rownames_to_column("PID")
+
+gs_node_table_select <- read.csv("../RNA_Seq/output/data/geneset_node_table_select.csv") %>%
+                                mutate(border_value = 1)
+
+gs_edge_table_select <- read.csv("../RNA_Seq/output/data/transcriptomic_network_table_select.csv") %>%
+                  mutate(edge_value = "0.01")
+
+gene_node_table_select <- read.csv("../RNA_Seq/output/data/gene_node_table_select.csv") %>% dplyr::rename(node = "hgnc_symbol")
+   
+
+
+```
+
+```{r load metabolon}
+
+metab_matrix_select <- read.table("../Metabolon/Baseline_analysis_Metabolon/output/data/metabolon_mixomics_ecport_select.csv", 
+                         sep = "!", header = TRUE) %>%
+                spread(BIOCHEMICAL, value)
+
+metabolite_set_node_table_select <- read.table("../Metabolon/Baseline_analysis_Metabolon/output/data/metabolon_gs_node_table_select.csv",
+                                        sep ="!", header = TRUE) %>%
+                                mutate(border_value = 1)
+
+                              
+metabolite_node_table_select <- read.table("../Metabolon/Baseline_analysis_Metabolon/output/data/metabolon_metabolite_node_table_select.csv",
+                                        sep = "!", header = TRUE) %>%
+                                mutate(border_value = 1)
+
+metabolite_edge_table_select <- read.table("../Metabolon/Baseline_analysis_Metabolon/output/data/metabolon_gs_edge_table_select.csv",
+                                        sep = "!", header = TRUE) %>%
+                        mutate(edge_value = "0.01") %>%
+                        dplyr::select(source, everything())
+   
+
+
+```
+
+```{r load proteomics}
+
+
+proteom_sig_select <- readRDS("../Caprion_proteomics_metab/Caprion_proteomics/output/data/V1_proteomics_univariate_stats_Breadth_culmin.RDS") %>%
+  filter(p.value < 0.1)
+
+proteom_matrix_select <- readRDS("../Caprion_proteomics_metab/Caprion_proteomics/output/data/V1_proteomics_mat.RDS") %>%
+                as.data.frame(.) %>%
+                rownames_to_column("PID") %>%
+                gather(protein, value,-PID) %>%
+                filter(protein %in% proteom_sig_select$protein) %>%
+                #mutate(protein = gsub("_HUMAN", "", protein)) %>%
+                spread(protein, value) 
+
+
+proteomic_node_table_select <- proteom_sig_select %>%
+                              dplyr::rename(node = "protein") %>%
+                              mutate(category = "protein", 
+                                     value = ifelse(t > 0, 1, -1),
+                                     border_value = 1) %>%
+                              dplyr::select(node, value, category, border_value)
+
+```
+
+```{r filter_on_common_select}
+# common_PIDs <- intersect(c(flow_matrix$PID, metab_matrix$PID), trans_matrix$PID)
+# 
+allmats_select <- list("flow" = flow_matrix_select, "metabolon" = metab_matrix_select, "transcriptomic" = trans_matrix_select,
+                       "proteomics" = proteom_matrix_select)
+```
+
+
+
+
+```{r mixomics_select}
+#par(mar=c(1,1,1,1))
+
+
+# for every pair of omics, identify complete set of participants
+outLS_select <- list()
+candidateOmics <- names(allmats_select)
+combos <- combn(candidateOmics, m= 2, simplify = FALSE)
+
+options(device = "quartz")
+outLS_select <- list()
+for(i in 1:length(combos)){
+  omic1 <- combos[[i]][1]
+  omic2 <- combos[[i]][2]
+  omic1_Mat <- as.data.frame(allmats_select[[omic1]]) 
+  omic2_Mat <- as.data.frame(allmats_select[[omic2]]) 
+
+  merged_Mat_filt <- omic1_Mat %>%
+                  inner_join(.,omic2_Mat, by = "PID") %>%
+                  filter(complete.cases(.))
+  omic1_Mat_filt <- merged_Mat_filt %>%
+    dplyr::select(colnames(omic1_Mat)) %>%
+    remove_rownames(.) %>%
+    column_to_rownames("PID") %>%
+    as.matrix(.)
+  omic2_Mat_filt <- merged_Mat_filt %>%
+    dplyr::select(colnames(omic2_Mat)) %>%
+    remove_rownames(.) %>%
+    column_to_rownames("PID") %>%
+    as.matrix(.)
+
+  splsFull <- spls(omic1_Mat_filt,
+                      omic2_Mat_filt,
+                       mode  = "regression",
+                       scale = TRUE)
+  set.seed(seed = 1)
+  splsCV <- perf(splsFull,
+                     validation = "loo",
+                     progressBar = FALSE)
+  nComp <- which.max(splsCV$Q2.total)
+  keep.X <- apply(abs(splsFull$loadings$X), 1, sum) > 0
+  keep.Y <- apply(abs(splsFull$loadings$Y), 1, sum) > 0
+  cord.X <- cor(splsFull$X[, keep.X], splsFull$variates$X[, 1:nComp],
+                use = "pairwise")
+  cord.Y <- cor(splsFull$Y[, keep.Y], splsFull$variates$X[, 1:nComp],
+                use = "pairwise")
+  simFullMat <- cord.X %*% t(cord.Y)
+  rThreshold <- quantile(as.numeric(simFullMat), probs = 0.975)
+  if (rThreshold > 0) {
+      # net <- network(splsFull,
+      #              comp = 1:2,
+      #              cutoff = rThreshold)
+      outLS_select[[paste0(omic1, "_", omic2)]] <- network(splsFull,
+                                                 comp = 1:2,
+                                                 cutoff = rThreshold)
+  }
+}
+
+network_table_mixomics_select <- do.call("rbind",lapply(names(outLS_select), function(x){
+    output <- outLS_select[[x]]$M %>%
+                as.data.frame(.) %>%
+                rownames_to_column("source") %>%
+                gather(target, edge_value, -source) %>%
+                filter(edge_value != 0)
+    return(output)
+}))
+
+
+# write.table(merged_node_table_select, file = "merged_node_table_select.csv", sep ="!", quote = FALSE, row.names = FALSE)
+
+merged_network_table_temp_select <- rbind(gs_edge_table_select, metabolite_edge_table_select) %>%
+                              filter(target %in% c(network_table_mixomics_select$source,
+                                                   network_table_mixomics_select$target))
+
+merged_network_table_select <- rbind(network_table_mixomics_select, merged_network_table_temp_select)
+write.table(merged_network_table_select, file = "merged_network_table_select.csv", sep ="!", row.names = FALSE, quote = FALSE)
+
+ 
+
+
+merged_node_table_select <- do.call("rbind", list(metabolite_set_node_table_select,
+                                                 metabolite_node_table_select, 
+                                                 flow_node_table_select,
+                                                 gs_node_table_select, 
+                                                 gene_node_table_select,
+                                                 proteomic_node_table_select)) %>%
+                      filter(node %in% c(merged_network_table_select$source,
+                                         merged_network_table_select$target)) %>%
+                      mutate(node_name = node) %>%
+                      mutate(node_name = gsub("_HUMAN", "", node_name))
+                 
+                  
+write.table(merged_node_table_select, file = "merged_node_table_select.csv", sep ="!", quote = FALSE, row.names = FALSE)
+
+
+
+
+ISG_interactome <- read_excel(path = "41590_2019_323_MOESM4_ESM.xlsx", sheet = "ISG Interactions") 
+
+selected_colnames_ISG <- c("...1", colnames(ISG_interactome)[!grepl("[...]", colnames(ISG_interactome))])
+
+
+
+ISG_interactome_edge_table <- ISG_interactome %>%
+                          dplyr::select(selected_colnames_ISG) %>%
+                          as.data.frame(.) %>%
+                          gather(target, value, -1) %>%
+                          filter(value != "Interactor") %>%
+                          filter(!is.na(value )) %>%
+                          dplyr::rename(source = "...1") %>%
+                          filter(target %in% c(merged_network_table_select$source, merged_network_table_select$target )) %>%
+                          filter(source %in% c(merged_network_table_select$source, merged_network_table_select$target ))
+
+                      
+
+```
+
+
+

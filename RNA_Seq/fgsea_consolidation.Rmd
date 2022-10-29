@@ -1,0 +1,1021 @@
+---
+title: "fgsea_consolidation"
+author: "Adam Pelletier"
+date: "2/24/2019"
+output: html_document
+---
+
+```{r setup, message = FALSE, warning=FALSE}
+#### Load required packages for analysis
+## Some packages may require installation from Bioconductor : "https://bioconductor.org/install/" 
+suppressPackageStartupMessages(library(rstudioapi))
+suppressPackageStartupMessages(library(plyr))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(purrr))
+suppressPackageStartupMessages(library(tidyr))
+suppressPackageStartupMessages(library(pheatmap))
+suppressPackageStartupMessages(library(DESeq2))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(biomaRt))
+suppressPackageStartupMessages(library(GSEABase))
+suppressPackageStartupMessages(library(fgsea))
+suppressPackageStartupMessages(library(stringr))
+suppressPackageStartupMessages(library(tibble))
+suppressPackageStartupMessages(library(GSVA))
+suppressPackageStartupMessages(library(cluster))
+suppressPackageStartupMessages(library(apeglm))
+suppressPackageStartupMessages(library(ggrepel))
+suppressPackageStartupMessages(library(sva))
+suppressPackageStartupMessages(library(affy))
+suppressPackageStartupMessages(library(igraph))
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(getwd())
+```
+
+
+
+```{r gsea_hm_jacc}
+
+
+
+compute_modules_func_total_gs <- function(fgsea_output, 
+                                          geneset_GMT, 
+                                padj_threshold = 0.05,
+                                jaccard_threshold = 0.5, 
+                                filename) {
+  
+  
+  pathDF <- as.data.frame(fgsea_output) %>% 
+          filter(padj < padj_threshold) 
+  #### enrichment map
+  # define nes (1 or -1)
+  nes = 1
+  nes_check <- FALSE
+  outGS_list <- c()
+  while(nes_check == FALSE){
+    if(nes == -1) {
+      leDF <- pathDF %>% dplyr::filter(NES < 0)
+      } else {
+          leDF <- pathDF %>% dplyr::filter(NES > 0)
+      }
+    genecoll <- geneset_GMT
+    genecoll <- genecoll[names(genecoll) %in% leDF$pathway]
+    leLS <- geneIds(genecoll)
+    
+    # calculate Jaccard index
+      gsDist <- sapply(leLS, function(gs1) {
+        gsDist <- sapply(leLS, function(gs2) {
+                    gs1 <- gs1
+                    gs2 <- gs2
+                    jaccardIndex <- length(intersect(gs1, gs2))
+                    jaccardIndex <- jaccardIndex /
+                                    (length(gs1) + length(gs2) - jaccardIndex)
+        return(value = jaccardIndex)
+      })
+        return(value = gsDist)
+    })
+      
+    # filter based on jaccard threshold
+    gsMin <- gsDist
+    gsMin[gsMin < jaccard_threshold] <- 0
+    
+    ## remove all singletons
+    # flag <- rowSums(gsMin) > 1 | colSums(gsMin) > 1
+    # gsFilt <- gsMin[flag, flag]
+    # 
+    # # create graph
+    # g <- graph.adjacency(gsFilt,
+    #                      mode = "undirected",
+    #                      weighted = TRUE,
+    #                      diag = FALSE)
+    # # decompose graph into modules and find most frequent genes of each module
+    # gD <- decompose(g)
+    # 
+    # outNet <- lapply(1:length(gD), FUN = function(i) {
+    #             gsName <- V(gD[[i]])$"name"
+    #   
+    #     topGS <- gsName
+    #     return(topGS)
+    #         })
+    # # outNet <- do.call(what = rbind, outNet)
+    # outGS_list <- c(outGS_list,outNet)
+    outGS_list <- c(outGS_list,gsDist)
+    if(nes == -1){
+      nes_check <- TRUE
+    }
+    nes <- -1
+  }
+
+  return(gsDist)
+  # return(outGS_list)
+}
+
+c2c5c7_GMT <- getGmt(geneset_list[["c2c5c7"]])
+
+test <- compute_modules_func_total_gs(fgsea_output = fgsea_cytok$DV3_AUCp_log$c2c5c7$output,
+                              geneset = c2c5c7_GMT,
+                              jaccard_threshold = 0.25)
+
+test2 <- compute_modules_func_ledge(fgsea_output = fgsea_cytok$DV3_AUCp_log$c2c5c7$output,
+                              jaccard_threshold = 0.25)
+
+
+pops_D91 <- compute_modules_func_ledge(fgsea_output = fgsea_populations$D91_Breadth$c2c5c7$output, 
+                                p_threshold = 0.05,
+                                jaccard_threshold = 0.25)
+
+
+pops_consolid <- lapply(fgsea_populations$D91_Breadth$c2c5c7)
+```
+
+
+```{r jaccard_test}
+compute_jaccard_distance_matrix <- function(NES_matrix,
+                                            outcome,
+                                            jaccard_threshold = 0.5) {
+  
+  
+  leDF <- NES_matrix
+  leLS <- leDF[[outcome]]
+  names(leLS) <- leDF$pathway
+  
+  # calculate Jaccard index
+    gsDist <- sapply(leLS, function(gs1) {
+      gsDist <- sapply(leLS, function(gs2) {
+                  gs1 <- gs1
+                  gs2 <- gs2
+                  jaccardIndex <- length(intersect(gs1, gs2))
+                  jaccardIndex <- jaccardIndex /
+                                  (length(gs1) + length(gs2) - jaccardIndex)
+      return(value = 1 - jaccardIndex)
+    })
+      return(value = gsDist)
+  })
+    
+  return(gsDist)
+}
+
+filter_fgsea_regex <- function(fgsea_object,
+                               geneset,
+                               regex){
+  out_object <- list()
+  for(i in names(fgsea_object)){
+    temp_df <- as.data.frame(fgsea_object[[i]][[geneset]]$output) %>%
+                filter(grepl(regex,pathway))
+    out_object[[i]][[geneset]]$output <- temp_df
+  }
+  return(out_object)
+}
+
+
+extract_pvalues <- function(fgsea_object,
+                            outcomes,
+                            geneset, 
+                            regex_extract,
+                            filename) {
+  sigp <- 0.05
+  thr <- abs(log2(sigp))
+  totdf <- c()
+  for(i in outcomes){
+    df <- fgsea_object[[i]][[geneset]]$output %>%
+    as.data.frame(.) %>%
+    mutate(outcome = i) %>%
+    mutate(padj = ifelse(NES > 0 , abs(log2(padj)), log2(padj))) %>%
+    dplyr::select(pathway, outcome, padj) 
+    totdf <- rbind(df, totdf)
+  }
+  totdf <- totdf %>%
+    mutate(sig_check = ifelse(abs(padj) >= thr, 1, 0)) %>%
+    mutate(UP_check = ifelse(padj > thr, 1, 0)) %>%
+    mutate(DN_check = ifelse(padj < -thr, 1, 0)) %>%
+    group_by(pathway) %>% 
+    mutate(keywords = str_extract_all(pathway,regex_extract, simplify = FALSE)) %>%
+    mutate(keywords = paste(unique(unlist(keywords)), collapse = ", "))  %>%
+    mutate(n_outcomes = sum(sig_check)) %>%
+    mutate(UP = sum(UP_check)) %>%
+    mutate(DN = sum(DN_check)) %>%
+    ungroup(.) %>%
+    dplyr::select(-sig_check, -UP_check, -DN_check) %>%
+    spread(outcome, padj) %>% 
+    mutate(signature_label = "") %>%
+    mutate(exclude = 0) %>%
+    filter(n_outcomes > 0 )
+  writexl::write_xlsx(totdf, path = filename)
+  
+  return(totdf)
+}
+
+# 
+# 
+# fgsea_analysis_select <- fgsea_analysis[c("D180_Breadth",  "D56_Breadth",  "D91_Breadth", 
+#                                           "DV1_AUCp_log", "DV2_AUCp_log", "DV3_AUCp_log", "DV4_AUCp_log")] 
+
+
+c2c5 <- getGmt(file.path(genesetsDir,"c2c5.all.v6.1.ENS.ID.gmt.txt"))
+fgsea_analysis_select2 <- sapply(names(fgsea_analysis2), simplify = FALSE, USE.NAMES = TRUE, function(x){
+    
+    imp <- fgsea_analysis2[[x]]
+    imp$c2c5c7$output <- imp$c2c5c7$output[imp$c2c5c7$output$pathway %in% names(c2c5),]
+    return(imp)
+  
+})
+
+
+
+# fgsea_cytok <- filter_fgsea_regex(fgsea_analysis_select,
+#                    geneset = "c2c5c7",
+#                    regex = c2_subset_inflam)
+
+test <- names(c2c5)
+test <- test[grepl("TFH|FOLLICULAR|MONOCYTE", test)]
+
+fgsea_cytok2 <- filter_fgsea_regex(fgsea_analysis_select2,
+                   geneset = "c2c5c7",
+                   regex = c2_subset_inflam)
+
+
+write.csv(file = file.path(dataOutDir,"fgsea_cytok_unannot.csv"), x = fgsea_cytok2$Cumulative_Breadth_dichot$c2c5c7$output %>%
+              as.data.frame(.) %>%
+              select(-leadingEdge), row.names = FALSE )
+# test1 <- fgsea_cytok$DV1_AUCp_log$c2c5c7$output %>% filter(grepl("TNF", pathway))
+
+read_cytok_annot <- read.table(file = file.path(dataOutDir,"fgsea_cytok_annot.csv"), sep = ",", header = TRUE) %>%
+                      filter(keep == 1) %>%
+                      dplyr::select(pathway,Annot)
+
+fgsea_cytok_filt <- sapply(names(fgsea_cytok2), simplify = FALSE, USE.NAMES = TRUE, function(x){
+  imp <- fgsea_cytok2[[x]]
+  temp_df <- imp$c2c5c7$output 
+  temp_df <- temp_df %>%
+        inner_join(.,read_cytok_annot, by = "pathway")
+  
+  imp$c2c5c7$output <- temp_df
+  return(imp)
+})
+
+
+
+fgsea_tf <- fgsea_analysis_select2
+
+
+write.csv(file = file.path(dataOutDir,"fgsea_c3_unannot.csv"), x = fgsea_tf$Cumulative_Breadth_dichot$c3$output %>%
+              as.data.frame(.) %>%
+              select(-leadingEdge), row.names = FALSE )
+# test1 <- fgsea_cytok$DV1_AUCp_log$c2c5c7$output %>% filter(grepl("TNF", pathway))
+
+read_c3_annot <- read.table(file = file.path(dataOutDir,"fgsea_c3_annot.csv"), sep = ",", header = TRUE) %>%
+                      filter(keep == 1) %>%
+                      dplyr::select(pathway,Annot) %>%
+                      filter(Annot %in% c("FOXO3", "AP2", "NFKB"))
+
+fgsea_c3_filt <- sapply(names(fgsea_tf), simplify = FALSE, USE.NAMES = TRUE, function(x){
+  imp <- fgsea_tf[[x]]
+  temp_df <- imp$c3$output 
+  temp_df <- temp_df %>%
+        inner_join(.,read_c3_annot, by = "pathway")
+  
+  imp$c3$output <- temp_df
+  return(imp)
+})
+
+
+fgsea_interferome_annot <- fgsea_analysis2_interferome$D91_Breadth_dichot$interferome$output %>%
+                          mutate(Annot = c("Type I IFN interferome", "Type II IFN interferome", "Type III IFN interferome" ))
+
+merge_gs_breadth_df <- do.call("rbind", lapply(c("c2c5c7","c3", "interferome" ), function(x){
+  if(x == "c2c5c7"){
+    df <- fgsea_cytok_filt$Cumulative_Breadth_dichot[[x]]$output 
+  } else if(x == "c3"){
+    df <- fgsea_c3_filt$Cumulative_Breadth_dichot[[x]]$output
+  } else{
+    df <- fgsea_interferome_annot
+  }
+  df <- df %>% mutate(genesetColl = x)
+  return(df)
+}))  %>%
+    rename(geneset = "pathway") %>%
+    rename(pathway = "Annot") %>%
+    filter(!pathway %in% c("IFNA pathway", "IFNB pathway")) %>%
+    dplyr::select(pathway, everything()) %>%
+    mutate(pathway = gsub("interferonme", "interferome", pathway)) %>%
+    filter(!grepl("Type III", pathway))
+
+
+
+
+
+
+NES_barchart(merge_gs_breadth_df, 
+             filename = file.path(GSEA_fig_Dir, "dichot_Culmin_breadth.pdf"),
+             title = "dichot_breadth")
+
+
+merge_gs_breadth_df_gs_edge_table <- merge_gs_breadth_df %>%
+                          unnest(leadingEdge) %>%
+                          inner_join(.,all_ids, by = c("leadingEdge" = "ensembl_gene_id")) %>%
+                          filter(hgnc_symbol != "") %>%
+                          dplyr::select(pathway, hgnc_symbol)  %>%
+                          rename(source = "pathway") %>%
+                          rename(target  = "hgnc_symbol") %>%
+                          mutate(edge_value = "NA") %>%
+                          mutate(source = ifelse(grepl("pathway",source), as.character(source),
+                                                 paste(source,"_pathway", sep ="")))
+
+write.csv(merge_gs_breadth_df_gs_edge_table, file = file.path(dataOutDir,"transcriptomic_network_table.csv"), 
+            row.names = FALSE, quote = FALSE)
+                          
+merge_gs_breadth_df_gs_node_table <- merge_gs_breadth_df %>%
+                          dplyr::select(pathway, NES)  %>%
+                          rename(value = "NES") %>%
+                          mutate(value = sign(value)) %>%
+                          mutate(category = "geneset") %>%
+                          rename(node = "pathway") %>%
+                          mutate(node =  ifelse(grepl("pathway", node), as.character(node), 
+                                                paste(node,"_pathway", sep="")))
+
+write.csv(merge_gs_breadth_df_gs_node_table, file = file.path(dataOutDir,"geneset_node_table.csv"), 
+            row.names = FALSE, quote = FALSE)
+
+
+deseq_DEG_cul_br <- meta_dds2$Cumulative_Breadth_dichot$res %>%
+                      as.data.frame(.) %>%
+                      rownames_to_column("ensembl_gene_id") 
+
+merge_gs_breadth_df_gene_node_table <- merge_gs_breadth_df %>%
+                          unnest(leadingEdge) %>%
+                          dplyr::select(leadingEdge) %>%
+                          inner_join(.,deseq_DEG_cul_br, 
+                                     by =c("leadingEdge" = "ensembl_gene_id")) %>%
+                          mutate(value = sign(log2FoldChange)) %>%
+                          inner_join(.,all_ids, by = c("leadingEdge" = "ensembl_gene_id")) %>%
+                          filter(hgnc_symbol != "") %>%
+                          mutate(category = "gene") %>%
+                          dplyr::select(hgnc_symbol, value, category)
+
+write.csv(merge_gs_breadth_df_gene_node_table, file = file.path(dataOutDir,"gene_node_table.csv"), 
+            row.names = FALSE, quote = FALSE)
+                                  
+
+combat_corr_filt_integration <- combat_corr_filt %>%
+                    filter(hgnc_symbol %in% merge_gs_breadth_df_gene_node_table$hgnc_symbol) %>%
+                    ungroup(.) %>%
+                    dplyr::select(-EnsID) %>%
+                    column_to_rownames("hgnc_symbol") %>%
+                    t(.)
+
+write.csv(combat_corr_filt_integration, file = file.path(dataOutDir,"gene_matrix_for_mixomics.csv"), 
+            quote = FALSE)
+
+
+
+
+
+#Filtered mixomics output
+
+read_cytok_annot_select <- read_cytok_annot %>%
+                        filter(grepl("IFN|TNFA|CXCR4|TGFB1", Annot))
+
+fgsea_cytok_filt_select <- sapply(names(fgsea_cytok2), simplify = FALSE, USE.NAMES = TRUE, function(x){
+  imp <- fgsea_cytok2[[x]]
+  temp_df <- imp$c2c5c7$output 
+  temp_df <- temp_df %>%
+        inner_join(.,read_cytok_annot_select, by = "pathway")
+  
+  imp$c2c5c7$output <- temp_df
+  return(imp)
+})
+
+
+
+
+# test1 <- fgsea_cytok$DV1_AUCp_log$c2c5c7$output %>% filter(grepl("TNF", pathway))
+
+read_c3_annot_select <- read_c3_annot %>%
+                  filter(grepl("SMAD4|NFKB", Annot))
+
+fgsea_c3_filt_select <- sapply(names(fgsea_tf), simplify = FALSE, USE.NAMES = TRUE, function(x){
+  imp <- fgsea_tf[[x]]
+  temp_df <- imp$c3$output 
+  temp_df <- temp_df %>%
+        inner_join(.,read_c3_annot_select, by = "pathway")
+  
+  imp$c3$output <- temp_df
+  return(imp)
+})
+
+
+merge_gs_breadth_select <- list()
+merge_gs_breadth_select_df <- do.call("rbind", list(fgsea_c3_filt_select$Cumulative_Breadth_dichot$c3$output,
+                                    fgsea_cytok_filt_select$Cumulative_Breadth_dichot$c2c5c7$output,
+                                    fgsea_interferome_annot)) %>%
+                rename(geneset = "pathway") %>%
+                rename(pathway = "Annot") %>%
+                filter(!pathway %in% c("IFNA pathway", "IFNB pathway")) %>%
+                filter(!grepl("Type III", pathway )) %>%
+                dplyr::select(pathway, everything())
+
+
+
+NES_barchart(merge_gs_breadth_df %>% filter(!grepl("Type III", pathway)),
+             filename = file.path(GSEA_fig_Dir, "dichot_Culmin_breadth_select.pdf"),
+             title = "dichot_breadth",
+             width = 0.4)
+
+
+merge_gs_breadth_df_gs_edge_table_select <- merge_gs_breadth_select_df %>%
+                          unnest(leadingEdge) %>%
+                          inner_join(.,all_ids, by = c("leadingEdge" = "ensembl_gene_id")) %>%
+                          filter(hgnc_symbol != "") %>%
+                          dplyr::select(pathway, hgnc_symbol)  %>%
+                          rename(source = "pathway") %>%
+                          rename(target  = "hgnc_symbol") %>%
+                          mutate(edge_value = "NA") %>%
+                          mutate(source = ifelse(grepl("pathway",source), as.character(source),
+                                                 paste(source,"_pathway", sep ="")))
+
+write.csv(merge_gs_breadth_df_gs_edge_table_select, file = file.path(dataOutDir,"transcriptomic_network_table_select.csv"), 
+            row.names = FALSE, quote = FALSE)
+                          
+merge_gs_breadth_df_gs_node_table_select <- merge_gs_breadth_select_df %>%
+                          dplyr::select(pathway, NES)  %>%
+                          rename(value = "NES") %>%
+                          mutate(value = sign(value)) %>%
+                          mutate(category = "geneset") %>%
+                          rename(node = "pathway") %>%
+                          mutate(node =  ifelse(grepl("pathway", node), as.character(node), 
+                                                paste(node,"_pathway", sep="")))
+
+write.csv(merge_gs_breadth_df_gs_node_table_select, file = file.path(dataOutDir,"geneset_node_table_select.csv"), 
+            row.names = FALSE, quote = FALSE)
+
+
+deseq_DEG_cul_br_select <- meta_dds2$Cumulative_Breadth_dichot$res %>%
+                      as.data.frame(.) %>%
+                      rownames_to_column("ensembl_gene_id") 
+
+merge_gs_breadth_df_gene_node_table_select <- merge_gs_breadth_select_df %>%
+                          unnest(leadingEdge) %>%
+                          dplyr::select(leadingEdge) %>%
+                          inner_join(.,deseq_DEG_cul_br_select, 
+                                     by =c("leadingEdge" = "ensembl_gene_id")) %>%
+                          mutate(value = sign(log2FoldChange)) %>%
+                          inner_join(.,all_ids, by = c("leadingEdge" = "ensembl_gene_id")) %>%
+                          left_join(.,extracellular_merged, by = c("leadingEdge" = "ensembl_gene_id")) %>%
+                          mutate(border_value = ifelse(signalp_go_combined == "extracellular", 2, 1)) %>%
+                          mutate(border_value = ifelse(is.na(border_value), 1, border_value)) %>%
+                          filter(hgnc_symbol != "") %>%
+                          mutate(category = "gene") %>%
+                          dplyr::select(hgnc_symbol, value, category, border_value)
+
+write.csv(merge_gs_breadth_df_gene_node_table_select, file = file.path(dataOutDir,"gene_node_table_select.csv"), 
+            row.names = FALSE, quote = FALSE)
+                                  
+
+combat_corr_filt_integration_select <- combat_corr_filt %>%
+                    filter(hgnc_symbol %in% merge_gs_breadth_df_gene_node_table_select$hgnc_symbol) %>%
+                    ungroup(.) %>%
+                    dplyr::select(-EnsID) %>%
+                    column_to_rownames("hgnc_symbol") %>%
+                    t(.)
+
+write.csv(combat_corr_filt_integration_select, file = file.path(dataOutDir,"gene_matrix_for_mixomics_select.csv"), 
+            quote = FALSE)
+
+
+
+
+
+
+# cytok_breadth_unfilt <- extract_pvalues(fgsea_cytok,
+#                         outcomes = c("D91_Breadth", "D56_Breadth", "D180_Breadth"),
+#                         geneset = "c2c5c7",
+#                         regex_extract =  c2_subset_inflam,
+#                         filename = "output/data/fgsea_cytokines_Breadth_unfilt.xlsx")
+# 
+# cytok_AUC_unfilt <- extract_pvalues(fgsea_cytok,
+#                         outcomes = c("DV1_AUCp_log", "DV2_AUCp_log", "DV3_AUCp_log", "DV4_AUCp_log"),
+#                         geneset = "c2c5c7",
+#                         regex_extract =  c2_subset_inflam,
+#                         filename = "output/data/fgsea_cytokines_AUC_unfilt.xlsx")
+# 
+# 
+# 
+# fgsea_metab <- filter_fgsea_regex(fgsea_analysis_select,
+#                    geneset = "c2c5c7",
+#                    regex = c2_subset_metab)
+# 
+# metab_breadth_unfilt <- extract_pvalues(fgsea_metab,
+#                         outcomes = c("D91_Breadth", "D56_Breadth", "D180_Breadth"),
+#                         geneset = "c2c5c7",
+#                         regex_extract =  c2_subset_metab,
+#                         filename = "output/data/fgsea_metabolism_Breadth_unfilt.xlsx")
+# 
+# metab_AUC_unfilt <- extract_pvalues(fgsea_metab,
+#                         outcomes = c("DV1_AUCp_log", "DV2_AUCp_log", "DV3_AUCp_log", "DV4_AUCp_log"),
+#                         geneset = "c2c5c7",
+#                         regex_extract =  c2_subset_metab,
+#                         filename = "output/data/fgsea_metabolism_AUC_unfilt.xlsx")
+# 
+# 
+# 
+# 
+# fgsea_populations <- filter_fgsea_regex(fgsea_analysis_select,
+#                    geneset = "c2c5c7",
+#                    regex = c7_subset_populations)
+# 
+# popul_breadth_unfilt <- extract_pvalues(fgsea_populations,
+#                         outcomes = c("D91_Breadth", "D56_Breadth", "D180_Breadth"),
+#                         geneset = "c2c5c7",
+#                         regex_extract =  c7_subset_populations,
+#                         filename = "output/data/fgsea_populations_Breadth_unfilt.xlsx")
+# 
+# popul_AUC_unfilt <- extract_pvalues(fgsea_populations,
+#                         outcomes = c("DV1_AUCp_log", "DV2_AUCp_log", "DV3_AUCp_log", "DV4_AUCp_log"),
+#                         geneset = "c2c5c7",
+#                         regex_extract =  c7_subset_populations,
+#                         filename = "output/data/fgsea_populations_AUC_unfilt.xlsx")
+# 
+# 
+# 
+# UR_breadth_unfilt <- extract_pvalues(fgsea_analysis_select,
+#                         outcomes = c("D91_Breadth", "D56_Breadth", "D180_Breadth"),
+#                         geneset = "c3",
+#                         regex_extract = ".*",
+#                         filename = "output/data/fgsea_URs_Breadth_unfilt.xlsx")
+# 
+# UR_AUC_unfilt <- extract_pvalues(fgsea_analysis_select,
+#                         outcomes = c("DV1_AUCp_log", "DV2_AUCp_log", "DV3_AUCp_log", "DV4_AUCp_log"),
+#                         geneset = "c3",
+#                         regex_extract = ".*",
+#                         filename = "output/data/fgsea_UR_AUC_unfilt.xlsx")
+# 
+
+
+
+
+
+
+
+
+test1 <- fgsea_cytok$DV1_AUCp_log$c2c5c7$output %>%
+          filter(padj < 0.05)
+test3 <- compute_modules_func(fgsea_cytok$DV1_AUCp_log$c2c5c7$output, jaccard_threshold = 0.25)
+
+
+```
+
+
+```{r NES_barchart_LM22}
+lm22_barchart <- NES_barchart(fgsea_analysis2_lm22$Cumulative_Breadth_dichot$LM22$output %>% filter(padj < 0.05),
+             filename = file.path(GSEA_fig_Dir, "dichot_Culmin_breadth_select_LM22.pdf"),
+             title = "dichot_breadth",
+             width = 0.4,
+             space_width = 0.2)
+
+pdf(file.path(GSEA_fig_Dir, "dichot_Culmin_breadth_select_LM22.pdf"), height = 6, width = 8)
+lm22_barchart
+dev.off()
+
+```
+
+
+```{r FGSEA_HM_MOD}
+consolidate_fgsea_analysis <- function(fgsea_object, 
+                                       geneset, 
+                                       annot_file,
+                                       outcomes){
+  
+  annot_df <- annot_file %>%
+              filter(KEEP == 1) %>%
+              dplyr::select(pathway, INVERT)
+              
+  
+  out_object <- fgsea_object
+  out_object[!names(out_object) %in% outcomes] <- NULL
+  for(i in outcomes){
+    df <- out_object[[i]][[geneset]]$output %>%
+            filter(pathway %in% annot_df$pathway) %>%
+            inner_join(annot_df, by = "pathway") %>%
+            mutate(NES = ifelse(is.na(INVERT),NES, NES*-1)) %>%
+            dplyr::select(-INVERT)
+    out_object[[i]][[geneset]]$output <- df
+  }
+  return(out_object)
+}
+
+gsea_hm_mod <- function(fgsea_object,
+                    contrasts,
+                    geneset,
+                    pval_thr,
+                    filename, 
+                    clusterRowsGap = TRUE, 
+                    subset = c(),
+                    cleanup =c(),
+                    cleanup_cols= c(), 
+                    top = 30, 
+                    transpose = FALSE,
+                    gsAnnot,
+                    width = 12,
+                    height = 8,
+                    hm.params = NULL){
+  df <- c()
+  
+  contrast_iter <- names(fgsea_object)
+  contrast_iter <- contrast_iter[contrast_iter %in% contrasts]
+  contrast_cols <- contrast_iter
+  top_pathways <- list()
+  for(i in contrast_iter) {
+    if(dim(fgsea_object[[i]][[geneset]][["output"]][1]) > 0){
+      df_temp <- fgsea_object[[i]][[geneset]][["output"]] %>%
+      as.data.frame(.) %>%
+      filter(padj <= pval_thr) 
+
+      top_df <- df_temp %>%
+        arrange(padj)
+      top_pathways[[i]] <-  top_df$pathway
+      
+      df_temp <- df_temp %>%
+        dplyr::select(pathway,NES)
+        colnames(df_temp)[2] <- i
+    } else {
+      df_temp <- c()
+      contrast_cols <- contrast_cols[!contrast_cols == i]
+    } 
+    
+      if(!is.data.frame(df)){
+        df <- df_temp
+      } else if (is.data.frame(df_temp)){
+        df <- merge(df,df_temp, by="pathway", all=TRUE)
+      }
+  } 
+
+  
+  df <- df %>%
+    gather(contrast,NES,-pathway) %>%
+    mutate(NES = ifelse(is.na(NES), 0 , NES)) %>%
+    mutate(NES = as.numeric(NES)) %>%
+    spread(contrast,NES) 
+  df <- df[,c("pathway",contrast_cols)]
+  
+  if(length(subset) > 0){
+    top_grep <- c()
+    
+    for(i in top_pathways){
+      top_grep_temp <- i
+      top_grep <- c(top_grep, top_grep_temp[grepl(subset, top_grep_temp)][1:top])
+    }
+    top_grep <- unique(top_grep)
+    top_grep <- top_grep[!is.na(top_grep)]
+    df <- df %>%
+      filter(grepl(subset,pathway)) %>%
+      filter(pathway %in% top_grep)
+  }
+  
+  gsAnnot_upd <- gsAnnot %>% 
+              as.data.frame(.) 
+  
+  
+  hm_object <- list()
+  hm_object$genesets <- df$pathway
+  for(i in names(cleanup)){
+    df$pathway <- gsub(i,cleanup[[i]],df$pathway)
+    gsAnnot_upd$pathway <- gsub(i,cleanup[[i]],gsAnnot_upd$pathway)
+  }
+  
+  for(i in names(cleanup_cols)){
+    colnames(df) <- gsub(i, cleanup_cols[[i]], colnames(df))
+  }
+  
+  row.names(gsAnnot_upd) <- gsAnnot_upd$pathway
+  gsAnnot_upd <- gsAnnot_upd["signature_label"]
+  
+  get_group_number = function(){
+      i = 0
+      function(){
+          i <<- i+1
+          i
+      }
+  }
+  group_number = get_group_number()
+  
+  
+  order_df <- gsAnnot_upd %>% 
+    rownames_to_column("pathway") %>%
+    as.data.frame(.) %>% 
+    group_by(signature_label) %>%
+    mutate(order = group_number()) %>%
+    ungroup(.)
+  #print(order_df)
+
+  # print(order_df)
+  df <- distinct(df, pathway, .keep_all = TRUE) %>%
+    inner_join(order_df, by = "pathway") %>%
+    arrange(order) %>%
+    dplyr::select(-order, -signature_label) %>%
+    mutate(pathway = toupper(pathway)) %>%
+    column_to_rownames("pathway") %>%
+    as.matrix(.)
+  #print(df)
+
+  
+  paletteLength <- 500
+  colorLS <- colorRampPalette(colors = c("blue", "cyan",
+                                         "white",
+                                        "yellow", "red"))(paletteLength)
+  
+  
+
+  topScale <- max(abs(min(df)),abs(max(df)))
+  myBreaks <- seq(-topScale, topScale, length.out=paletteLength)
+  hm.params_default <- list(
+    mat = t(df),
+    main = paste("GSEA_",geneset, sep=""),
+    color = colorLS,
+    fontsize= 10,
+    cellheight = 20,
+    cellwidth = 20,
+    show_colnames = FALSE,
+    annotation_names_row = FALSE,
+    annotation_col = gsAnnot_upd,
+    labels_col = gsAnnot_upd,
+    breaks = myBreaks,
+    cluster_cols = FALSE,
+    cluster_rows = FALSE,
+    angle_col = 315,
+    filename = filename,
+    treeheight_col = 5,
+    width = width,
+    height = height
+  )
+  
+  if(!is.null(hm.params)){
+      print("aloha")
+      hm.params <- modifyList(hm.params_default,hm.params)
+      #print(hm.params)
+    } else {
+      hm.params <- hm.params_default
+    }
+  
+  print(t(df))
+  if (clusterRowsGap == FALSE) {
+    p <- do.call(pheatmap, hm.params)
+    
+    hm_object$clusterRow <- "none"
+  } else {
+    p_temp <- pheatmap(df)
+    
+    cluster_annot <- heatmap_gap_clustering(p_temp, K.max = dim(df)[1] -1 )
+    dev.off()
+    hm.params_default <- list(df,
+             main = paste("GSEA_",geneset, sep=""),
+                  color = colorLS,
+                  fontsize= 8,
+                  cellheight = 9,
+                  cellwidth = 9,
+                  show_colnames = FALSE,
+                  annotation_names_row = FALSE,
+                  cluster_cols = FALSE,
+                  breaks = myBreaks,
+                  annotation_row = cluster_annot$df["clusterID"],
+                  filename = filename,
+                  angle_col = 45 )
+    
+    if(!is.null(hm.params)){
+      print("aloha")
+      hm.params <- modifyList(hm.params,hm.params_default)
+      print(hm.params)
+    } else {
+      hm.params <- hm.params_default
+    }
+    
+    
+    p <- do.call("pheatmap", hm.params)
+    # p <- pheatmap(df,
+    #          main = paste("GSEA_",geneset, sep=""),
+    #               color = colorLS,
+    #               fontsize= 8,
+    #               cellheight = 9,
+    #               cellwidth = 9,
+    #               show_colnames = FALSE,
+    #               annotation_names_row = FALSE,
+    #               cluster_cols = FALSE,
+    #               breaks = myBreaks,
+    #               annotation_row = cluster_annot$df["clusterID"],
+    #               filename = filename,
+    #               angle_col = 45)
+
+
+    hm_object$clusterRow <- cluster_annot
+  }
+  
+  hm_object$plot <- p
+  hm_object$matrix <- df
+  return(hm_object)
+}
+
+```
+
+```{r fgsea_consolidation}
+breadth_cytok_consol <- read_xlsx(path = "output/data/fgsea_cytokines_Breadth_filt.xlsx") 
+AUCp_cytok_consol <- read_xlsx(path = "output/data/fgsea_cytokines_AUC_filt.xlsx") 
+
+breadth_cytok_consol_minimal <- read_xlsx(path = "output/data/fgsea_cytokines_Breadth_filt.xlsx")  %>%
+                              filter(KEEP == 1) %>%
+                              # group_by(pathway) %>%
+                              # group_indices(.)
+                              group_by(signature_label) %>%
+                              mutate(abs_br = abs(D91_Breadth)) %>%
+                              arrange(desc(abs_br)) %>%
+                              filter(row_number() ==1 ) %>%
+                              ungroup(.)
+  
+                              
+
+EB_cytok <- consolidate_fgsea_analysis(fgsea_object = fgsea_cytok,
+                           geneset = "c2c5c7",
+                           annot_file = breadth_cytok_consol, 
+                           outcomes = early_breadth )
+
+EB_cytok_minimal <- consolidate_fgsea_analysis(fgsea_object = fgsea_cytok,
+                           geneset = "c2c5c7",
+                           annot_file = breadth_cytok_consol_minimal, 
+                           outcomes = early_breadth )
+
+AUC_cytok <- consolidate_fgsea_analysis(fgsea_object = fgsea_cytok,
+                           geneset = "c2c5c7",
+                           annot_file = AUCp_cytok_consol, 
+                           outcomes = AUCp )
+
+
+
+
+gsea_hm_mod(fgsea_object = EB_cytok,
+            contrasts =  early_breadth,
+            geneset = "c2c5c7",
+            pval_thr =  0.05, 
+            filename = file.path(GSEA_fig_Dir,"early_breadth_cytok_consol_GSEA_hm.pdf"), 
+            cleanup=list("_" = " " ,"HALLMARK" = ""),
+            cleanup_cols= list("_" = " ", "log" = ""),
+            clusterRowsGap = FALSE,
+            transpose = TRUE,
+            gsAnnot = breadth_cytok_consol)
+
+
+hm_params.minimal <- list(show_colnames = FALSE, 
+                          #labels_col = breadth_cytok_consol_minimalsignature_label,
+                          annotation_col = FALSE)
+
+gsea_hm_mod(fgsea_object = EB_cytok_minimal,
+            contrasts =  early_breadth,
+            geneset = "c2c5c7",
+            pval_thr =  0.05, 
+            filename = file.path(GSEA_fig_Dir,"early_breadth_cytok_consol__minimal_GSEA_hm.pdf"), 
+            cleanup_cols= list("_" = " ", "log" = ""),
+            clusterRowsGap = FALSE,
+            transpose = TRUE,
+            gsAnnot = breadth_cytok_consol_minimal,
+            hm.params = hm_params.minimal)
+
+gsea_hm_mod(fgsea_object = AUC_cytok,
+            contrasts =  AUCp,
+            geneset = "c2c5c7",
+            pval_thr =  0.05, 
+            filename = file.path(GSEA_fig_Dir,"AUCp_cytok_consol_GSEA_hm.pdf"), 
+            cleanup=list("_" = " " ,"HALLMARK" = ""),
+            cleanup_cols= list("_" = " ", "log" = ""),
+            clusterRowsGap = FALSE,
+            transpose = TRUE,
+            gsAnnot = AUCp_cytok_consol,
+            width = 15)
+
+breadth_metab_consol <- read_xlsx(path = "output/data/fgsea_metabolism_Breadth_filt.xlsx") 
+AUCp_metab_consol <- read_xlsx(path = "output/data/fgsea_metabolism_AUC_filt.xlsx") 
+
+EB_METAB <- consolidate_fgsea_analysis(fgsea_object = fgsea_metab,
+                           geneset = "c2c5c7",
+                           annot_file = breadth_metab_consol, 
+                           outcomes = early_breadth )
+
+AUC_METAB <- consolidate_fgsea_analysis(fgsea_object = fgsea_metab,
+                           geneset = "c2c5c7",
+                           annot_file = AUCp_metab_consol, 
+                           outcomes = AUCp )
+
+gsea_hm_mod(fgsea_object = EB_METAB,
+            contrasts =  early_breadth,
+            geneset = "c2c5c7",
+            pval_thr =  0.05, 
+            filename = file.path(GSEA_fig_Dir,"early_breadth_metab_consol_GSEA_hm.pdf"), 
+            cleanup=list("_" = " " ,"HALLMARK" = ""),
+            cleanup_cols= list("_" = " ", "log" = ""),
+            clusterRowsGap = FALSE,
+            transpose = TRUE,
+            gsAnnot = breadth_metab_consol)
+
+gsea_hm_mod(fgsea_object = AUC_METAB,
+            contrasts =  AUCp,
+            geneset = "c2c5c7",
+            pval_thr =  0.05, 
+            filename = file.path(GSEA_fig_Dir,"AUCp_metab_consol_GSEA_hm.pdf"), 
+            cleanup=list("_" = " " ,"HALLMARK" = ""),
+            cleanup_cols= list("_" = " ", "log" = ""),
+            clusterRowsGap = FALSE,
+            transpose = TRUE,
+            gsAnnot = AUCp_metab_consol,
+            width = 15)
+
+
+```
+
+
+
+
+```{r gsva z scores}
+
+geneset_list_combined <- c(geneset_list, geneset_list2)
+
+
+combined_gsC <- sapply(unique(merge_gs_breadth_df$genesetColl), simplify = F, USE.NAMES = T, function(x){
+    gsC <- getGmt(geneset_list_combined[[x]])
+    return(gsC)
+})
+
+gsva_zscores <- function(fgsea_table, pathway_name, combatCorr_mat){
+  df <- fgsea_table %>%
+          filter(pathway == pathway_name) %>%
+          unnest(cols = leadingEdge) 
+  
+  df_annot <- df %>%
+              dplyr::select(pathway, geneset) %>%
+              unique()
+  ledge <- df$leadingEdge
+  gsColl <- unique(df$genesetColl)
+  print(gsColl)
+  gs <- unique(df$geneset)
+  mat_filt <- combatCorr_mat %>%
+                ungroup() %>%
+                filter(EnsID %in% ledge) %>%
+                dplyr::select(-hgnc_symbol) %>%
+                column_to_rownames("EnsID") %>%
+                as.matrix()
+  gsColl_select <- combined_gsC[[gsColl]]
+  gs_select <- gsColl_select[names(gsColl_select) == gs ]
+  gsva <- gsva(expr = mat_filt, gset.idx.list = gs_select, method = "zscore") %>%
+            as.data.frame() %>%
+            rownames_to_column("geneset") %>%
+            inner_join(., df_annot, by ="geneset") %>%
+            dplyr::select(-geneset) %>%
+            gather(PID, zscores, -pathway)
+  return(gsva)
+} 
+
+selected_gs_zscores_cytok <- do.call("rbind", lapply(merge_gs_breadth_df$pathway, function(x){
+   df <- gsva_zscores(fgsea_table = merge_gs_breadth_df, pathway_name = x, combatCorr_mat = combat_corr_filt)
+   return(df)
+})) 
+
+
+selected_metab_path <- fgsea_analysis2$Cumulative_Breadth_dichot$c2c5c7$output %>%
+                            filter(grepl("BILE|PHOSPHATIDYLCHOL|ACYLGLYCEROL|BENZOATE", pathway)) %>%
+                            mutate(geneset = pathway) %>%
+                            mutate(genesetColl = "c2c5c7")
+
+
+write.table(selected_metab_path %>%
+    filter(pathway == "GO_BILE_ACID_METABOLIC_PROCESS") %>%
+    unnest(cols = "leadingEdge") %>%
+    inner_join(., all_ids, by = c("leadingEdge" = "ensembl_gene_id")) , file = "output/data/bile_acid_ledge.txt",
+    sep = "\t", quote = F, row.names = F)
+
+selected_gs_zscores_metab <- do.call("rbind", lapply(selected_metab_path$pathway, function(x){
+   df <- gsva_zscores(fgsea_table = selected_metab_path, pathway_name = x, combatCorr_mat = combat_corr_filt)
+   return(df)
+})) 
+
+selected_gs_zscores <- rbind(selected_gs_zscores_cytok, selected_gs_zscores_metab) %>%
+                        spread(pathway, zscores)
+  
+write.csv(selected_gs_zscores, "output/data/transcriptomic_selected_gs_gsva.csv")
+
+
+node_table_cytok <- merge_gs_breadth_df %>%
+                          dplyr::select(pathway, NES) %>%
+                          mutate(sign = sign(NES)) %>%
+                          rename(node = "pathway") %>%
+                          mutate(node_type = "inflammation_transcriptomic_pathway")
+
+
+node_table_metab <- fgsea_analysis2$Cumulative_Breadth_dichot$c2c5c7$output %>%
+                      filter(pathway %in% selected_gs_zscores_metab$pathway) %>%
+                      dplyr::select(pathway, NES) %>%
+                      mutate(sign = sign(NES)) %>%
+                      rename(node = "pathway") %>%
+                      mutate(node_type = "metabolic_transcriptomic_pathway")
+node_table_tr_sel_path <- rbind(node_table_cytok, node_table_metab)
+
+write.csv(node_table_tr_sel_path, "output/data/transcriptomic_selected_node_table.csv")
+
+
+```
