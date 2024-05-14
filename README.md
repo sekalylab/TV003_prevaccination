@@ -1,4 +1,5 @@
 # TV003_prevaccination
+[![DOI](https://zenodo.org/badge/559307154.svg)](https://zenodo.org/doi/10.5281/zenodo.11193903)
 
 Prevaccination study of Dengue vaccine TV003 immunogenicity
 
